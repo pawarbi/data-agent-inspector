@@ -2,6 +2,8 @@
 
 A diagnostic analyzer for Microsoft Fabric Data Agent. Upload a diagnostics JSON file and visually inspect agent configuration, conversation turns, generated queries, latency, and automated issue detection.
 
+https://data-agent-inspector.streamlit.app/
+
 ## Features
 
 - **Conversation Viewer** -- Browse user/assistant exchanges with generated DAX, SQL, KQL, and GQL queries, execution outputs, and step-by-step trace details.
