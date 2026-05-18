@@ -12,6 +12,7 @@ https://data-agent-inspector.streamlit.app/
 - **Configuration Inspector** -- View agent instructions, data source descriptions, instructions, few-shot examples, and connection details per source.
 - **Schema Explorer** -- Sidebar tree view of all data source elements (tables, columns, measures, entities) with selection status.
 - **Analysis Dashboard** -- Configuration metrics, schema quality summary, response time chart, step breakdown table, and automated issue detection with severity levels.
+- **ERD View** -- Shows semantic model relationships.
 - **Multi-Source Support** -- Semantic Models, Lakehouse Tables, KQL Databases, Ontology (Graph), SQL Databases, and more.
 - **Latency Analysis** -- Identify slow responses with detailed time breakdowns per step.
 - **Issue Detection** -- Automated checks for missing descriptions, failed runs, slow queries, unselected sources, and other common configuration problems.
