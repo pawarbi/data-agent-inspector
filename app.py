@@ -293,6 +293,17 @@ def parse_diagnostics(raw):
     config = raw.get("config", {}).get("configuration", {})
     datasources_raw = raw.get("datasources", {})
     thread = raw.get("thread", {})
+    latency_raw = raw.get("latency", {}) or {}
+
+    latency_by_step_id = {
+        tc.get("step_id", ""): tc.get("duration_seconds")
+        for tc in latency_raw.get("tool_calls", [])
+        if tc.get("step_id")
+    }
+    run_started_at = {
+        r.get("id", ""): r.get("created_at", 0) or 0
+        for r in thread.get("runs", [])
+    }
 
     # Metadata
     meta = {
@@ -313,7 +324,7 @@ def parse_diagnostics(raw):
     fewshot_results = _parse_fewshot_loading(thread.get("run_steps", []))
 
     # Conversations
-    conversations = _parse_conversations(thread)
+    conversations = _parse_conversations(thread, latency_by_step_id, run_started_at)
 
     return {
         "meta": meta,
@@ -367,6 +378,21 @@ def _parse_data_sources(config, datasources_raw):
         # Few-shot examples from config
         few_shot_examples = ds_conf.get("few_shot_examples") or []
 
+        # Semantic model relationships (csdl_relationships is a JSON string)
+        relationships = []
+        if ds_type == "semantic_model":
+            md = ds_schema.get("metadata") or {}
+            rels_raw = md.get("csdl_relationships")
+            if isinstance(rels_raw, str):
+                try:
+                    parsed_rels = json.loads(rels_raw)
+                    if isinstance(parsed_rels, list):
+                        relationships = parsed_rels
+                except (json.JSONDecodeError, TypeError):
+                    relationships = []
+            elif isinstance(rels_raw, list):
+                relationships = rels_raw
+
         data_sources.append({
             "id": ds_id,
             "name": (
@@ -381,13 +407,18 @@ def _parse_data_sources(config, datasources_raw):
             "elements": ds_schema.get("elements", []),
             "connection": connection,
             "few_shot_examples": few_shot_examples,
+            "relationships": relationships,
         })
 
     return data_sources
 
 
-def _parse_conversations(thread):
+def _parse_conversations(thread, latency_by_step_id=None, run_started_at=None):
     """Parse thread into conversation turns with associated steps."""
+    if latency_by_step_id is None:
+        latency_by_step_id = {}
+    if run_started_at is None:
+        run_started_at = {}
     messages = thread.get("messages", [])
     runs = thread.get("runs", [])
     run_steps = thread.get("run_steps", [])
@@ -409,7 +440,7 @@ def _parse_conversations(thread):
         }
 
     # Index tool calls by run_id
-    steps_by_run = _parse_run_steps(run_steps)
+    steps_by_run = _parse_run_steps(run_steps, latency_by_step_id)
 
     # Pair user questions with assistant answers
     conversations = []
@@ -425,6 +456,7 @@ def _parse_conversations(thread):
         run_info = runs_map.get(run_id, {})
         raw_steps = steps_by_run.get(run_id, [])
         analyze_steps = _group_analyze_steps(raw_steps)
+        gantt_steps = _build_gantt_steps(raw_steps, run_started_at.get(run_id, 0))
 
         # Detect cached responses:
         #  - Answer exists but no run was created (run_id is empty/null)
@@ -446,29 +478,38 @@ def _parse_conversations(thread):
             "response_time_s": run_info.get("total_time_s", 0),
             "status": run_info.get("status", "unknown"),
             "steps": analyze_steps,
+            "gantt_steps": gantt_steps,
+            "run_started_at": run_started_at.get(run_id, 0),
             "is_cached": is_cached,
         })
 
     return conversations
 
 
-def _parse_run_steps(run_steps):
+def _parse_run_steps(run_steps, latency_by_step_id=None):
     """Parse run_steps into tool call dicts indexed by run_id."""
+    if latency_by_step_id is None:
+        latency_by_step_id = {}
     steps_by_run = {}
-    for s in run_steps:
+    for idx, s in enumerate(run_steps):
         run_id = s.get("run_id", "")
         if s.get("type") != "tool_calls":
             continue
 
+        step_id = s.get("id", "")
         created = s.get("created_at", 0) or 0
         completed = s.get("completed_at", 0) or 0
         duration = completed - created if completed and created else 0
+        latency_duration_s = latency_by_step_id.get(step_id)
 
         for tc in s.get("step_details", {}).get("tool_calls", []):
             func = tc.get("function", {})
             args = _safe_json(func.get("arguments"))
 
             steps_by_run.setdefault(run_id, []).append({
+                "step_id": step_id,
+                "created_at": created,
+                "order": idx,
                 "func_name": func.get("name", "unknown"),
                 "datasource_name": args.get("datasource_name", ""),
                 "datasource_type": args.get("datasource_type", ""),
@@ -476,10 +517,38 @@ def _parse_run_steps(run_steps):
                 "code": args.get("code", ""),
                 "output": func.get("output", "") or "",
                 "duration_s": duration,
+                "latency_duration_s": latency_duration_s,
                 "status": s.get("status", ""),
             })
 
     return steps_by_run
+
+
+def _build_gantt_steps(raw_steps, run_start):
+    """Chain raw_steps sequentially from run_start using latency or fallback durations."""
+    if not run_start or not raw_steps:
+        return []
+
+    ordered = sorted(raw_steps, key=lambda s: (s.get("created_at", 0) or 0, s.get("order", 0)))
+    gantt = []
+    cursor = run_start
+    for s in ordered:
+        lat = s.get("latency_duration_s")
+        if lat is not None:
+            duration = lat
+        else:
+            duration = max(s.get("duration_s", 0) or 0, 0)
+        start = cursor
+        end = cursor + max(duration, 1)
+        gantt.append({
+            "step_id": s.get("step_id", ""),
+            "tool_name": s.get("func_name", "unknown"),
+            "start": start,
+            "end": end,
+            "duration_s": duration,
+        })
+        cursor = end
+    return gantt
 
 
 def _group_analyze_steps(raw_steps):
@@ -1004,39 +1073,152 @@ def _render_turn(conv):
                     _render_time_breakdown(conv)
                 for step in conv["steps"]:
                     _render_step(step)
+
+            gantt = conv.get("gantt_steps") or []
+            if gantt:
+                gantt_label = f"Latency breakdown — {len(gantt)} tool call{'s' if len(gantt) != 1 else ''}"
+                with st.expander(gantt_label, expanded=is_slow):
+                    _render_turn_latency(conv)
         elif conv["answer"]:
             st.caption("No data query steps — agent answered from LLM knowledge")
 
     st.markdown("---")
 
 
-def _render_time_breakdown(conv):
-    """Show a visual time breakdown for slow responses."""
-    steps = conv["steps"]
-    total = conv["response_time_s"]
-    step_total = sum(s["duration_s"] for s in steps)
-    orchestrator = max(0, total - step_total)
+def _render_turn_latency(conv):
+    """Per-turn latency breakdown: small Gantt + table of tool calls in time order."""
+    gantt = conv.get("gantt_steps") or []
+    if not gantt:
+        return
 
-    # Build breakdown bars
+    run_start = gantt[0]["start"]
     rows = []
-    for s in steps:
-        pct = (s["duration_s"] / total * 100) if total > 0 else 0
-        label = s["source_name"] or s["source_type"] or "step"
-        rows.append({"Component": f"{s['code_language']} · {label}", "Duration (s)": s["duration_s"], "% of Total": pct})
+    for i, g in enumerate(gantt, 1):
+        rows.append({
+            "#": i,
+            "Tool": g["tool_name"],
+            "Start (s)": max(0, g["start"] - run_start),
+            "Duration (s)": g["duration_s"],
+        })
+    df = pd.DataFrame(rows)
+
+    nonzero = [g for g in gantt if g["duration_s"] > 0]
+    if nonzero:
+        try:
+            import plotly.express as px
+            timeline_rows = []
+            for g in gantt:
+                timeline_rows.append({
+                    "Tool": g["tool_name"],
+                    "Step": f"{g['tool_name']}",
+                    "Start": datetime.fromtimestamp(g["start"], tz=timezone.utc),
+                    "Finish": datetime.fromtimestamp(g["end"], tz=timezone.utc),
+                    "Duration (s)": g["duration_s"],
+                })
+            tdf = pd.DataFrame(timeline_rows)
+            fig = px.timeline(
+                tdf,
+                x_start="Start",
+                x_end="Finish",
+                y="Tool",
+                color="Tool",
+                hover_data=["Duration (s)"],
+            )
+            fig.update_yaxes(autorange="reversed")
+            fig.update_layout(
+                height=max(160, 28 * tdf["Tool"].nunique() + 80),
+                margin=dict(t=10, b=30, l=10, r=10),
+                showlegend=False,
+                xaxis_title="Time",
+                yaxis_title="",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        except ImportError:
+            pass
+
+    max_dur = max((g["duration_s"] for g in gantt), default=0)
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "#": st.column_config.NumberColumn("#", width="small"),
+            "Tool": st.column_config.TextColumn("Tool", width="medium"),
+            "Start (s)": st.column_config.NumberColumn("Start (s)", format="%.0f", width="small"),
+            "Duration (s)": st.column_config.ProgressColumn(
+                "Duration (s)",
+                min_value=0,
+                max_value=max(max_dur, 1),
+                format="%.0fs",
+            ),
+        },
+    )
+
+
+def _render_time_breakdown(conv):
+    """Show a visual time breakdown for slow responses.
+
+    Aligned with the Gantt: uses per-tool latency durations (when available)
+    instead of raw run_step wall-clock durations, so % of Total agrees with
+    the Latency breakdown / Step Duration Timeline.
+    """
+    total = conv["response_time_s"]
+    gantt = conv.get("gantt_steps") or []
+
+    rows = []
+    gantt_total = 0.0
+    if gantt:
+        # Aggregate per tool so the breakdown stays compact when many steps repeat
+        agg = {}
+        for g in gantt:
+            tool = g.get("tool_name", "unknown")
+            dur = g.get("duration_s", 0) or 0
+            agg[tool] = agg.get(tool, 0) + dur
+            gantt_total += dur
+        for tool, dur in sorted(agg.items(), key=lambda x: -x[1]):
+            pct = (dur / total * 100) if total > 0 else 0
+            rows.append({"Component": tool, "Duration (s)": dur, "% of Total": pct})
+    else:
+        # Fallback to analyze-step breakdown when no Gantt available
+        for s in conv["steps"]:
+            pct = (s["duration_s"] / total * 100) if total > 0 else 0
+            label = s["source_name"] or s["source_type"] or "step"
+            rows.append({
+                "Component": f"{s['code_language']} · {label}",
+                "Duration (s)": s["duration_s"],
+                "% of Total": pct,
+            })
+            gantt_total += s["duration_s"]
+
+    orchestrator = max(0, total - gantt_total)
     if orchestrator > 0:
-        rows.append({"Component": "Orchestrator (queue + response)", "Duration (s)": orchestrator,
-                      "% of Total": (orchestrator / total * 100) if total > 0 else 0})
+        rows.append({
+            "Component": "Orchestrator (queue + response)",
+            "Duration (s)": orchestrator,
+            "% of Total": (orchestrator / total * 100) if total > 0 else 0,
+        })
 
     df = pd.DataFrame(rows)
+    pct_sum = df["% of Total"].sum() if not df.empty else 0
+    parallel_note = ""
+    if pct_sum > 110:
+        parallel_note = (
+            " · sum exceeds 100% because some tool calls ran in parallel within the turn"
+        )
+
     st.markdown(
         '<div style="background:#fff3cd; border-left:3px solid #f39c12; padding:8px 12px; '
         'border-radius:4px; margin-bottom:10px; font-size:13px;">'
-        f'<strong>Slow response ({total:.0f}s)</strong> — breakdown:</div>',
+        f'<strong>Slow response ({total:.0f}s)</strong> — breakdown by tool (durations from '
+        f'<code>latency.tool_calls</code>{parallel_note}):</div>',
         unsafe_allow_html=True,
     )
     st.dataframe(df, use_container_width=True, hide_index=True,
-                 column_config={"% of Total": st.column_config.ProgressColumn(
-                     "% of Total", min_value=0, max_value=100, format="%.0f%%")})
+                 column_config={
+                     "Duration (s)": st.column_config.NumberColumn("Duration (s)", format="%.1f"),
+                     "% of Total": st.column_config.ProgressColumn(
+                         "% of Total", min_value=0, max_value=max(100, pct_sum), format="%.0f%%"),
+                 })
     st.markdown("")
 
 
@@ -1155,6 +1337,10 @@ def render_analysis(parsed):
 
     st.markdown("---")
     _render_step_breakdown(parsed["conversations"])
+    st.markdown("---")
+    _render_step_gantt(parsed["conversations"])
+    st.markdown("---")
+    _render_semantic_model_erd(parsed["data_sources"])
     st.markdown("---")
     _render_issue_detection(parsed)
 
@@ -1476,7 +1662,175 @@ def _render_step_breakdown(conversations):
             )
 
 
-# ── 5. Issue Detection ───────────────────────────────────
+def _render_step_gantt(conversations):
+    """Render a Gantt-style timeline of per-step durations across turns."""
+    rows = []
+    for conv in conversations:
+        gantt = conv.get("gantt_steps") or []
+        if not gantt:
+            continue
+        turn_label = f"T{conv.get('turn', '?')}"
+        question = conv.get("question", "") or ""
+        q_short = question if len(question) <= 80 else question[:77] + "..."
+        for g in gantt:
+            rows.append({
+                "Turn": turn_label,
+                "Tool": g.get("tool_name", "unknown"),
+                "Start": datetime.fromtimestamp(g.get("start", 0), tz=timezone.utc),
+                "Finish": datetime.fromtimestamp(g.get("end", 0), tz=timezone.utc),
+                "Duration (s)": g.get("duration_s", 0),
+                "Question": q_short,
+            })
+
+    if not rows:
+        return
+
+    df = pd.DataFrame(rows).sort_values("Start").reset_index(drop=True)
+
+    st.markdown("#### Step Duration Timeline (Gantt)")
+    st.caption(
+        "Steps are chained sequentially per run, starting from the run's created_at, "
+        "using `latency.tool_calls` durations when available (falls back to "
+        "completed_at − created_at for older logs)."
+    )
+
+    try:
+        import plotly.express as px
+        height = max(300, 28 * df["Turn"].nunique() + 100)
+        fig = px.timeline(
+            df,
+            x_start="Start",
+            x_end="Finish",
+            y="Turn",
+            color="Tool",
+            hover_data=["Duration (s)", "Question"],
+        )
+        fig.update_yaxes(autorange="reversed")
+        fig.update_layout(
+            height=height,
+            margin=dict(t=10, b=40),
+            xaxis_title="Time",
+            yaxis_title="Turn",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    except ImportError:
+        st.dataframe(df, hide_index=True, use_container_width=True)
+
+
+# ── 5b. Semantic Model ERD ───────────────────────────────
+
+_CARDINALITY_ENDS = {
+    "OneToOne": ("1", "1"),
+    "OneToMany": ("1", "*"),
+    "ManyToOne": ("*", "1"),
+    "ManyToMany": ("*", "*"),
+}
+
+
+def _safe_dot_id(name):
+    """Quote an identifier for DOT, escaping double quotes."""
+    return '"' + str(name).replace('"', '\\"') + '"'
+
+
+def _build_erd_dot(ds_name, relationships):
+    """Build a Graphviz DOT string for one semantic model's relationships."""
+    tables = set()
+    for r in relationships:
+        f = r.get("FromTable")
+        t = r.get("ToTable")
+        if f:
+            tables.add(f)
+        if t:
+            tables.add(t)
+
+    lines = [
+        f'digraph "{ds_name}" {{',
+        '  rankdir=LR;',
+        '  graph [bgcolor="transparent", pad="0.4", nodesep="0.6", ranksep="0.9"];',
+        '  node  [shape=box, style="rounded,filled", fillcolor="#1f2a3a", '
+        'fontcolor="#e6edf3", color="#4b5b75", fontname="Helvetica", fontsize=11];',
+        '  edge  [color="#7a8aa3", fontcolor="#9aa7bd", fontname="Helvetica", fontsize=9];',
+    ]
+    for t in sorted(tables):
+        lines.append(f'  {_safe_dot_id(t)};')
+
+    for r in relationships:
+        f = r.get("FromTable")
+        t = r.get("ToTable")
+        if not f or not t:
+            continue
+        fcol = r.get("FromColumn", "")
+        tcol = r.get("ToColumn", "")
+        card = r.get("Cardinality", "")
+        tail, head = _CARDINALITY_ENDS.get(card, ("", ""))
+        is_active = r.get("IsActive", True)
+        is_bi = r.get("IsBidirectional", False)
+
+        attrs = []
+        edge_label = f"{fcol} → {tcol}" if fcol or tcol else ""
+        if edge_label:
+            attrs.append(f'label="{edge_label}"')
+        if tail:
+            attrs.append(f'taillabel="{tail}"')
+        if head:
+            attrs.append(f'headlabel="{head}"')
+        attrs.append('labeldistance="1.8"')
+        attrs.append('labelangle="0"')
+        if not is_active:
+            attrs.append('style="dashed"')
+        if is_bi:
+            attrs.append('dir="both"')
+
+        lines.append(
+            f'  {_safe_dot_id(f)} -> {_safe_dot_id(t)} [{", ".join(attrs)}];'
+        )
+
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def _render_semantic_model_erd(data_sources):
+    """Render an ERD for each semantic_model data source that has relationships."""
+    sm_sources = [
+        ds for ds in data_sources
+        if ds.get("type") == "semantic_model" and ds.get("relationships")
+    ]
+    if not sm_sources:
+        return
+
+    st.markdown("#### Semantic Model Relationships (ERD)")
+    st.caption(
+        "Relationships parsed from `csdl_relationships`. Endpoint labels show "
+        "cardinality (1 / *); dashed edges are inactive; bidirectional edges use `dir=both`."
+    )
+
+    for idx, ds in enumerate(sm_sources):
+        rels = ds.get("relationships") or []
+        label = f"{ds.get('name', '?')} — {len(rels)} relationship{'s' if len(rels) != 1 else ''}"
+        with st.expander(label, expanded=(idx == 0)):
+            try:
+                dot = _build_erd_dot(ds.get("name", "model"), rels)
+                st.graphviz_chart(dot, use_container_width=True)
+            except Exception as e:
+                st.caption(f"Could not render ERD: {e}")
+
+            with st.expander("Relationship details", expanded=False):
+                df = pd.DataFrame([
+                    {
+                        "From Table": r.get("FromTable", ""),
+                        "From Column": r.get("FromColumn", ""),
+                        "To Table": r.get("ToTable", ""),
+                        "To Column": r.get("ToColumn", ""),
+                        "Cardinality": r.get("Cardinality", ""),
+                        "Active": r.get("IsActive", True),
+                        "Bidirectional": r.get("IsBidirectional", False),
+                    }
+                    for r in rels
+                ])
+                st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+# ── 6. Issue Detection ───────────────────────────────────
 
 def _render_issue_detection(parsed):
     """Automated issue detection with severity levels."""
@@ -1745,13 +2099,25 @@ def _render_banner():
                     Semantic Model Best Practices
                     <div class="res-label">Best practices for semantic model configuration</div>
                 </a>
-                <a href="https://learn.microsoft.com/en-us/fabric/data-science/data-agent-configurations" target="_blank">
-                    Data Agent Configurations
-                    <div class="res-label">How to configure Fabric Data Agents</div>
-                </a>
                 <a href="https://learn.microsoft.com/en-us/fabric/data-science/data-agent-configuration-best-practices" target="_blank">
-                    Configuration Best Practices
-                    <div class="res-label">Recommended configuration patterns</div>
+                    Data Agent Configuration Best Practices
+                    <div class="res-label">Recommended configuration patterns for Fabric Data Agents</div>
+                </a>
+                <a href="https://github.com/microsoft/fabric-toolbox/blob/main/samples/data_agent_checklist_notebooks/Semantic%20Model%20Data%20Agent%20Checklist.md" target="_blank">
+                    Semantic Model Data Agent Checklist
+                    <div class="res-label">Microsoft fabric-toolbox checklist notebook</div>
+                </a>
+                <a href="https://learn.microsoft.com/en-us/power-bi/developer/mcp/mcp-servers-overview#power-bi-mcp-server-local" target="_blank">
+                    Power BI MCP Server (Local)
+                    <div class="res-label">MCP servers overview for Power BI</div>
+                </a>
+                <a href="https://github.com/microsoft/skills-for-fabric" target="_blank">
+                    Skills for Fabric
+                    <div class="res-label">Microsoft skills-for-fabric GitHub repo</div>
+                </a>
+                <a href="https://fabricdataagent.com" target="_blank">
+                    fabricdataagent.com
+                    <div class="res-label">Community resource hub</div>
                 </a>
             </div>
         </div>
