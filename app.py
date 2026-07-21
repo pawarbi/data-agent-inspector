@@ -149,6 +149,11 @@ st.markdown("""
 .top-banner .banner-btn:hover {
     background: rgba(255,255,255,0.22);
 }
+.banner-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
 /* Resources dropdown */
 .resources-wrap {
     position: relative;
@@ -2090,11 +2095,13 @@ def _render_banner():
     <div class="top-banner">
         <div>
             <div class="banner-title">Agent Inspector</div>
-            <div class="banner-subtitle">Fabric Data Agent Diagnostics Analyzer</div>
+            <div class="banner-subtitle">Fabric Data Agent Diagnostics Analyzer by Sandeep Pawar</div>
         </div>
-        <div class="resources-wrap">
-            <a class="banner-btn" href="#" onclick="return false;">Resources</a>
-            <div class="resources-menu">
+        <div class="banner-actions">
+            <a class="banner-btn" href="https://github.com/pawarbi/data-agent-inspector/issues" target="_blank" rel="noopener noreferrer">Report Issue</a>
+            <div class="resources-wrap">
+                <a class="banner-btn" href="#" onclick="return false;">Resources</a>
+                <div class="resources-menu">
                 <a href="https://learn.microsoft.com/en-us/fabric/data-science/semantic-model-best-practices" target="_blank">
                     Semantic Model Best Practices
                     <div class="res-label">Best practices for semantic model configuration</div>
@@ -2119,6 +2126,7 @@ def _render_banner():
                     fabricdataagent.com
                     <div class="res-label">Community resource hub</div>
                 </a>
+                </div>
             </div>
         </div>
     </div>
