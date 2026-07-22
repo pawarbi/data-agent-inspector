@@ -11,6 +11,7 @@ https://data-agent-inspector.streamlit.app/
 - **Conversation Viewer** -- Browse user/assistant exchanges with generated DAX, SQL, KQL, and GQL queries, execution outputs, and step-by-step trace details.
 - **Configuration Inspector** -- View agent instructions, data source descriptions, instructions, few-shot examples, and connection details per source.
 - **Schema Explorer** -- Sidebar tree view of all data source elements (tables, columns, measures, entities) with selection status.
+- **Schema Inventory** -- Shows every exported table, column, and measure, including objects with missing descriptions and exports that omit child metadata.
 - **Analysis Dashboard** -- Configuration metrics, schema quality summary, response time chart, step breakdown table, and automated issue detection with severity levels.
 - **ERD View** -- Shows semantic model relationships.
 - **Multi-Source Support** -- Semantic Models, Lakehouse Tables, KQL Databases, Ontology (Graph), SQL Databases, and more.
@@ -53,7 +54,7 @@ https://data-agent-inspector.streamlit.app/
 
 ## Diagnostics JSON
 
-Export diagnostics from the Fabric Data Agent UI. The JSON contains agent configuration, data source schemas, conversation history, run steps, and tool call details.
+Export diagnostics from the Fabric Data Agent UI. The JSON contains agent configuration, data source schemas, conversation history, run steps, and tool call details. Both legacy schema-v2 files and current schema-v3 files are supported.
 
 Sample files are included in the `sample_diagnostics/` folder for testing.
 

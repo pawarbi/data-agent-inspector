@@ -256,6 +256,77 @@ def _safe_json(s):
         return {}
 
 
+def _json_text(value):
+    """Serialize any JSON-compatible value for safe display."""
+    return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+
+
+def _output_text(value):
+    """Normalize structured tool output to displayable text."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return _json_text(value)
+
+
+def _message_text(content):
+    """Extract message text from legacy content blocks or current string content."""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        return _extract_text(content)
+    return _output_text(content).strip()
+
+
+def _strip_code_fence(code):
+    """Remove a surrounding Markdown code fence from generated queries."""
+    code = _output_text(code).strip()
+    if not code.startswith("```"):
+        return code
+
+    lines = code.splitlines()
+    if len(lines) >= 2 and lines[-1].strip() == "```":
+        return "\n".join(lines[1:-1]).strip()
+    return code
+
+
+def _element_kind(element_type):
+    """Classify schema elements without treating grouping nodes as tables."""
+    normalized = (element_type or "").lower()
+    leaf_type = normalized.rsplit(".", 1)[-1]
+
+    if normalized == "ontology.entity" or leaf_type in {
+        "table",
+        "view",
+        "external_table",
+        "materialized_view",
+    }:
+        return "table"
+    if leaf_type == "column":
+        return "column"
+    if leaf_type == "measure":
+        return "measure"
+    return "group"
+
+
+def _schema_type_label(element_type):
+    """Return a user-facing label for a schema element type."""
+    normalized = (element_type or "").lower()
+    if normalized == "ontology.entity":
+        return "Entity"
+    leaf_type = normalized.rsplit(".", 1)[-1]
+    labels = {
+        "table": "Table",
+        "view": "View",
+        "external_table": "External table",
+        "materialized_view": "Materialized view",
+        "column": "Column",
+        "measure": "Measure",
+    }
+    return labels.get(leaf_type, "Object")
+
+
 def _ts(epoch):
     """Convert epoch to datetime."""
     if not epoch:
@@ -278,8 +349,13 @@ def validate_diagnostics(raw):
     missing = []
     if "config" not in raw:
         missing.append("config")
-    if "thread" not in raw:
-        missing.append("thread")
+    has_legacy_conversation = isinstance(raw.get("thread"), dict)
+    has_current_conversation = (
+        isinstance(raw.get("conversationItems"), list)
+        and isinstance(raw.get("responses"), list)
+    )
+    if not has_legacy_conversation and not has_current_conversation:
+        missing.append("thread or conversationItems/responses")
 
     if missing:
         return False, (
@@ -297,18 +373,7 @@ def parse_diagnostics(raw):
     """Parse diagnostics JSON into structured data for the UI."""
     config = raw.get("config", {}).get("configuration", {})
     datasources_raw = raw.get("datasources", {})
-    thread = raw.get("thread", {})
     latency_raw = raw.get("latency", {}) or {}
-
-    latency_by_step_id = {
-        tc.get("step_id", ""): tc.get("duration_seconds")
-        for tc in latency_raw.get("tool_calls", [])
-        if tc.get("step_id")
-    }
-    run_started_at = {
-        r.get("id", ""): r.get("created_at", 0) or 0
-        for r in thread.get("runs", [])
-    }
 
     # Metadata
     meta = {
@@ -325,11 +390,32 @@ def parse_diagnostics(raw):
     # Data sources
     data_sources = _parse_data_sources(config, datasources_raw)
 
-    # Few-shot loading results from run_steps
-    fewshot_results = _parse_fewshot_loading(thread.get("run_steps", []))
-
-    # Conversations
-    conversations = _parse_conversations(thread, latency_by_step_id, run_started_at)
+    thread = raw.get("thread")
+    if isinstance(thread, dict):
+        latency_by_step_id = {
+            tc.get("step_id", ""): tc.get("duration_seconds")
+            for tc in latency_raw.get("tool_calls", [])
+            if tc.get("step_id")
+        }
+        run_started_at = {
+            r.get("id", ""): r.get("created_at", 0) or 0
+            for r in thread.get("runs", [])
+        }
+        fewshot_results = _parse_fewshot_loading(thread.get("run_steps", []))
+        conversations = _parse_conversations(
+            thread,
+            latency_by_step_id,
+            run_started_at,
+        )
+    else:
+        data_source_names = {ds["id"]: ds["name"] for ds in data_sources}
+        current_steps = _parse_current_reasoning_steps(
+            raw.get("reasoningItemsByResponseId", {}),
+            latency_raw.get("reasoning_items", []),
+            data_source_names,
+        )
+        fewshot_results = _parse_current_fewshot_loading(current_steps)
+        conversations = _parse_current_conversations(raw, current_steps)
 
     return {
         "meta": meta,
@@ -357,28 +443,52 @@ def _parse_data_sources(config, datasources_raw):
         ds_type = ds_conf.get("type", ds_schema.get("type", "unknown"))
 
         # Connection details vary by source type
-        connection = {}
+        artifact_id = (
+            ds_conf.get("artifactId")
+            or ds_schema.get("id")
+            or ds_id
+        )
+        workspace_id = (
+            ds_conf.get("workspaceId")
+            or ds_schema.get("workspace_id")
+            or ""
+        )
+        connection = {
+            "workspace_id": workspace_id,
+            "artifact_id": artifact_id,
+        }
         if ds_type == "kusto":
-            connection = {
+            connection.update({
                 "endpoint": ds_conf.get("endpoint", ""),
                 "database": ds_conf.get("database_name", ""),
-                "kusto_id": ds_conf.get("kusto_id", ""),
-            }
-        elif ds_type == "lakehouse_tables":
-            connection = {
+                "kusto_id": ds_conf.get("kusto_id", "") or artifact_id,
+            })
+        elif ds_type in {"lakehouse", "lakehouse_tables"}:
+            connection.update({
                 "sql_endpoint": ds_conf.get("sql_endpoint", ""),
-                "lakehouse_name": ds_conf.get("lakehouse_name", ""),
-                "lakehouse_id": ds_conf.get("lakehouse_id", ""),
-            }
+                "lakehouse_name": (
+                    ds_conf.get("lakehouse_name")
+                    or ds_schema.get("display_name")
+                    or ""
+                ),
+                "lakehouse_id": ds_conf.get("lakehouse_id", "") or artifact_id,
+            })
         elif ds_type == "semantic_model":
-            connection = {
-                "semantic_model_name": ds_conf.get("semantic_model_name", ""),
-                "semantic_model_id": ds_conf.get("semantic_model_id", ""),
-            }
+            connection.update({
+                "semantic_model_name": (
+                    ds_conf.get("semantic_model_name")
+                    or ds_schema.get("semantic_model_name")
+                    or ds_schema.get("display_name")
+                    or ""
+                ),
+                "semantic_model_id": (
+                    ds_conf.get("semantic_model_id")
+                    or ds_schema.get("semantic_model_id")
+                    or artifact_id
+                ),
+            })
         elif ds_type == "ontology":
-            connection = {
-                "ontology_id": ds_conf.get("artifactId", ""),
-            }
+            connection["ontology_id"] = artifact_id
 
         # Few-shot examples from config
         few_shot_examples = ds_conf.get("few_shot_examples") or []
@@ -407,15 +517,165 @@ def _parse_data_sources(config, datasources_raw):
             ),
             "type": ds_type,
             "is_selected": ds_conf.get("isSelected", True),
+            "selection_state": ds_schema.get("selection_state", ""),
             "description": ds_schema.get("user_description") or "",
             "instructions": ds_schema.get("additional_instructions") or "",
-            "elements": ds_schema.get("elements", []),
+            "elements": ds_schema.get("elements") or [],
             "connection": connection,
             "few_shot_examples": few_shot_examples,
             "relationships": relationships,
         })
 
     return data_sources
+
+
+def _parse_current_reasoning_steps(
+    reasoning_by_response,
+    latency_items,
+    data_source_names=None,
+):
+    """Parse schema-v3 reasoning items into the legacy raw-step shape."""
+    data_source_names = data_source_names or {}
+    duration_by_item = {
+        (item.get("response_id", ""), item.get("reasoning_item_id", "")):
+            item.get("duration_seconds")
+        for item in latency_items or []
+        if item.get("response_id") and item.get("reasoning_item_id")
+    }
+
+    steps_by_response = {}
+    for response_id, reasoning_items in (reasoning_by_response or {}).items():
+        for item in reasoning_items or []:
+            if item.get("kind") != "tool-call":
+                continue
+
+            inputs = item.get("input")
+            if not isinstance(inputs, dict):
+                inputs = {}
+
+            source_id = (
+                inputs.get("datasource_artifact_id")
+                or inputs.get("data_source")
+                or ""
+            )
+            source_name = (
+                inputs.get("datasource_name")
+                or data_source_names.get(source_id)
+                or source_id
+            )
+            datasource_type = inputs.get("datasource_type", "")
+            if not datasource_type and "sql" in inputs:
+                datasource_type = "lakehouse"
+            code = (
+                inputs.get("code")
+                or inputs.get("sql")
+                or ""
+            )
+            natural_language_query = inputs.get("natural_language_query", "")
+            if not natural_language_query:
+                natural_language_query = inputs.get("query", "")
+
+            item_id = item.get("id", "")
+            steps_by_response.setdefault(response_id, []).append({
+                "step_id": item_id,
+                "created_at": 0,
+                "order": item.get("order", 0) or 0,
+                "func_name": item.get("title", "unknown"),
+                "datasource_name": source_name,
+                "datasource_type": datasource_type,
+                "nl_query": natural_language_query,
+                "code": _strip_code_fence(code),
+                "output": _output_text(item.get("output")),
+                "duration_s": duration_by_item.get(
+                    (response_id, item_id),
+                    0,
+                ) or 0,
+                "latency_duration_s": duration_by_item.get(
+                    (response_id, item_id),
+                ),
+                "status": item.get("status", ""),
+            })
+
+    return steps_by_response
+
+
+def _parse_current_fewshot_loading(steps_by_response):
+    """Extract few-shot loading results from schema-v3 reasoning items."""
+    results = []
+    for steps in steps_by_response.values():
+        for step in steps:
+            if "fewshot" not in step["func_name"].lower():
+                continue
+            results.append({
+                "datasource_name": step["datasource_name"],
+                "datasource_type": step["datasource_type"],
+                "output": step["output"],
+            })
+    return results
+
+
+def _parse_current_conversations(raw, steps_by_response):
+    """Parse schema-v3 conversation items and responses."""
+    conversation_items = raw.get("conversationItems", []) or []
+    responses = {
+        response.get("id", ""): response
+        for response in raw.get("responses", []) or []
+        if response.get("id")
+    }
+    response_duration = {
+        item.get("response_id", ""): item.get("duration_seconds")
+        for item in (raw.get("latency", {}) or {}).get("responses", [])
+        if item.get("response_id")
+    }
+    assistants_by_response = {
+        item.get("responseId"): item
+        for item in conversation_items
+        if item.get("role") == "assistant" and item.get("responseId")
+    }
+
+    conversations = []
+    user_items = [
+        item for item in conversation_items
+        if item.get("role") == "user" and item.get("responseId")
+    ]
+    for item in user_items:
+        response_id = item.get("responseId", "")
+        response = responses.get(response_id, {})
+        assistant = assistants_by_response.get(response_id, {})
+        raw_steps = steps_by_response.get(response_id, [])
+        analyze_steps = _group_analyze_steps(raw_steps)
+
+        started_at = response.get("createdAt", 0) or 0
+        completed_at = response.get("completedAt", 0) or 0
+        duration = response_duration.get(response_id)
+        if duration is None:
+            duration = (
+                completed_at - started_at
+                if completed_at and started_at
+                else 0
+            )
+
+        legacy = response.get("legacy")
+        if not isinstance(legacy, dict):
+            legacy = {}
+        run_id = legacy.get("runId", "") or ""
+        answer = _message_text(assistant.get("content", ""))
+        is_cached = bool(answer and not raw_steps and duration < 3)
+
+        conversations.append({
+            "turn": len(conversations) + 1,
+            "question": _message_text(item.get("content", "")),
+            "answer": answer,
+            "run_id": run_id,
+            "response_time_s": duration or 0,
+            "status": response.get("status", "unknown"),
+            "steps": analyze_steps,
+            "gantt_steps": _build_gantt_steps(raw_steps, started_at),
+            "run_started_at": started_at,
+            "is_cached": is_cached,
+        })
+
+    return conversations
 
 
 def _parse_conversations(thread, latency_by_step_id=None, run_started_at=None):
@@ -559,7 +819,10 @@ def _build_gantt_steps(raw_steps, run_start):
 def _group_analyze_steps(raw_steps):
     """Group nl2code + execute pairs into analyze operations, include trace steps."""
     nl2code = [s for s in raw_steps if "nl2code" in s["func_name"]]
-    execute = [s for s in raw_steps if "execute" in s["func_name"]]
+    execute = [
+        s for s in raw_steps
+        if s["func_name"].lower().endswith(".execute")
+    ]
     trace = [s for s in raw_steps if "trace." in s["func_name"]]
 
     ops = []
@@ -585,6 +848,7 @@ def _group_analyze_steps(raw_steps):
             generated_code = nl["output"]
         elif nl["code"]:
             generated_code = nl["code"]
+        generated_code = _strip_code_fence(generated_code)
 
         query_output = matched["output"] if matched else ""
         total_duration = nl["duration_s"] + (matched["duration_s"] if matched else 0)
@@ -613,8 +877,11 @@ def _group_analyze_steps(raw_steps):
             ops.append({
                 "source_name": ex["datasource_name"],
                 "source_type": ds_label,
-                "nl_query": "(direct execution, no NL query)",
-                "generated_code": ex["code"],
+                "nl_query": (
+                    ex["nl_query"]
+                    or "(direct execution, no NL query)"
+                ),
+                "generated_code": _strip_code_fence(ex["code"]),
                 "code_language": lang,
                 "output": ex["output"],
                 "duration_s": ex["duration_s"],
@@ -623,13 +890,13 @@ def _group_analyze_steps(raw_steps):
 
     # HV-2: Trace steps (debug info from trace.analyze_ontology, trace.analyze_lakehouse_tables, etc.)
     for t in trace:
-        args = {"query": t.get("nl_query", "")}
+        lang, _ = _detect_language(t["func_name"], t["datasource_type"])
         ops.append({
             "source_name": t["datasource_name"] or t["func_name"].split(".")[-1],
             "source_type": "Trace",
             "nl_query": t.get("nl_query", ""),
-            "generated_code": "",
-            "code_language": "Trace",
+            "generated_code": _strip_code_fence(t["code"]),
+            "code_language": lang if t["code"] else "Trace",
             "output": t["output"],
             "duration_s": t["duration_s"],
             "status": t["status"],
@@ -647,9 +914,19 @@ def _detect_language(func_name, datasource_type=""):
     if ds_type == "ontology":
         return "GQL", "Ontology"
 
-    if "semanticmodel" in fn:
+    if "semanticmodel" in fn or ds_type in {
+        "semantic_model",
+        "semanticmodel",
+        "powerbi",
+    }:
         return "Dax", "SemanticModel"
-    elif "database" in fn:
+    elif "database" in fn or ds_type in {
+        "lakehouse",
+        "lakehouse_tables",
+        "lakehousetable",
+        "database",
+        "sql",
+    }:
         return "SQL", "LakehouseTable"
     elif "kusto" in fn or "kql" in fn:
         return "KQL", "Kusto"
@@ -681,19 +958,18 @@ def _count_schema(elements):
     """Recursively count tables/entities, selected, columns, measures."""
     tables = selected = columns = measures = 0
     for el in elements:
-        el_type = el.get("type", "")
-        if "table" in el_type or "entity" in el_type:
+        kind = _element_kind(el.get("type", ""))
+        if kind == "table":
             tables += 1
             if el.get("is_selected"):
                 selected += 1
-            for child in el.get("children", []):
-                ct = child.get("type", "")
-                if "measure" in ct:
-                    measures += 1
-                elif "column" in ct:
-                    columns += 1
-        elif el.get("children"):
-            t, s, c, m = _count_schema(el["children"])
+        elif kind == "column":
+            columns += 1
+        elif kind == "measure":
+            measures += 1
+
+        if el.get("children"):
+            t, s, c, m = _count_schema(el.get("children", []))
             tables += t; selected += s; columns += c; measures += m
     return tables, selected, columns, measures
 
@@ -758,12 +1034,13 @@ def _render_schema_tree(elements):
 
     for el in elements:
         el_type = el.get("type", "")
+        kind = _element_kind(el_type)
         name = el.get("display_name", "unknown")
         selected = el.get("is_selected", False)
         children = el.get("children", [])
         check = "✅" if selected else "❌"
 
-        if "table" in el_type or "entity" in el_type:
+        if kind == "table":
             if children:
                 with st.expander(f"{check} {name}"):
                     for child in children:
@@ -786,7 +1063,7 @@ def _render_schema_child(child):
     data_type = child.get("data_type", "")
 
     check = "✅" if selected else "❌"
-    type_tag = "[M]" if "measure" in child_type else ""
+    type_tag = "[M]" if _element_kind(child_type) == "measure" else ""
 
     label = f"{check} {html_lib.escape(name)}"
     if type_tag:
@@ -823,6 +1100,9 @@ def _render_setup_tab(parsed):
                 st.markdown(ds["description"])
         elif is_ontology:
             st.caption("Data source description: N/A (not supported for ontology)")
+        else:
+            with st.expander("Data source description"):
+                st.caption("No data source description configured")
 
         # Data source instructions (all types)
         instr_text = ds["instructions"]
@@ -836,8 +1116,8 @@ def _render_setup_tab(parsed):
             with st.expander("Data source instructions"):
                 st.caption("No data source instructions configured")
 
-        # Schema descriptions (all types that have elements)
-        if ds.get("elements"):
+        # Semantic models always show schema status, even when the export is empty.
+        if ds["type"] == "semantic_model" or ds.get("elements"):
             _render_schema_descriptions(ds)
 
         # Few-shot examples from config
@@ -868,29 +1148,55 @@ def _render_setup_tab(parsed):
 
 
 def _render_schema_descriptions(ds):
-    """Show table/column/measure descriptions for a semantic model data source."""
+    """Show every table, column, and measure with description status."""
     elements = ds.get("elements", [])
     if not elements:
         st.caption("No schema data available")
         return
 
-    desc_rows = _collect_descriptions(elements)
+    schema_rows = _collect_schema_inventory(elements)
 
-    if not desc_rows:
-        st.caption("No descriptions configured on any table, column, or measure")
+    if not schema_rows:
+        st.caption("No table, column, or measure metadata found in this diagnostics file")
         return
 
     # Summary
-    total = len(desc_rows)
-    tables_with = sum(1 for r in desc_rows if r["type"] == "Table")
-    cols_with = sum(1 for r in desc_rows if r["type"] == "Column")
-    measures_with = sum(1 for r in desc_rows if r["type"] == "Measure")
-    over_200 = sum(1 for r in desc_rows if r["chars"] > THRESHOLDS["desc_char_limit"])
+    total = len(schema_rows)
+    table_types = {
+        "Table",
+        "View",
+        "External table",
+        "Materialized view",
+        "Entity",
+    }
+    tables = sum(1 for row in schema_rows if row["type"] in table_types)
+    columns = sum(1 for row in schema_rows if row["type"] == "Column")
+    measures = sum(1 for row in schema_rows if row["type"] == "Measure")
+    described = sum(
+        1 for row in schema_rows
+        if row["description_status"] == "Configured"
+    )
+    missing = total - described
+    over_200 = sum(
+        1 for row in schema_rows
+        if row["chars"] > THRESHOLDS["desc_char_limit"]
+    )
     warning = f" — {over_200} over {THRESHOLDS['desc_char_limit']} chars (DA truncates)" if over_200 else ""
-    st.caption(f"{total} descriptions: {tables_with} tables, {cols_with} columns, {measures_with} measures{warning}")
+    st.caption(
+        f"{total} objects: {tables} tables/views, {columns} columns, "
+        f"{measures} measures · descriptions {described}/{total} "
+        f"({missing} missing){warning}"
+    )
 
-    with st.expander(f"Schema descriptions ({total})", expanded=False):
-        df = pd.DataFrame(desc_rows)
+    omitted_children = _count_omitted_sub_elements(elements)
+    if omitted_children:
+        st.warning(
+            f"{omitted_children} table(s) indicate additional schema objects, but their "
+            "columns/measures were not included in this diagnostics export."
+        )
+
+    with st.expander(f"Schema inventory ({total})", expanded=False):
+        df = pd.DataFrame(schema_rows)
         # Flag descriptions over 200 chars
         df["flag"] = df["chars"].apply(lambda x: "!" if x > THRESHOLDS["desc_char_limit"] else "")
         st.dataframe(
@@ -901,50 +1207,65 @@ def _render_schema_descriptions(ds):
                 "table": st.column_config.TextColumn("Table", width="small"),
                 "name": st.column_config.TextColumn("Name", width="small"),
                 "type": st.column_config.TextColumn("Type", width="small"),
-                "description": st.column_config.TextColumn("Description", width="large"),
+                "selected": st.column_config.TextColumn("Selected", width="small"),
+                "description_status": st.column_config.TextColumn(
+                    "Description status",
+                    width="small",
+                ),
+                "description": st.column_config.TextColumn(
+                    "Description text",
+                    width="large",
+                ),
                 "chars": st.column_config.NumberColumn("Chars", width="small"),
                 "flag": st.column_config.TextColumn("", width="small"),
             },
         )
 
 
-def _collect_descriptions(elements, parent_table=""):
-    """Recursively collect all elements that have descriptions."""
+def _collect_schema_inventory(elements, parent_table=""):
+    """Recursively collect all tables, columns, and measures."""
     rows = []
     for el in elements:
         el_type = el.get("type", "")
+        kind = _element_kind(el_type)
         name = el.get("display_name", "?")
-        desc = el.get("description", "")
+        desc = _s(el.get("description", ""))
         children = el.get("children", [])
 
-        if "table" in el_type or "entity" in el_type:
-            type_label = "Entity" if "entity" in el_type else "Table"
-            if desc:
-                rows.append({
-                    "table": name,
-                    "name": name,
-                    "type": type_label,
-                    "description": desc,
-                    "chars": len(desc),
-                })
-            # Recurse into children (columns/measures)
-            for child in children:
-                child_name = child.get("display_name", "?")
-                child_type_raw = child.get("type", "")
-                child_desc = child.get("description", "")
-                if child_desc:
-                    rows.append({
-                        "table": name,
-                        "name": child_name,
-                        "type": "Measure" if "measure" in child_type_raw else "Column",
-                        "description": child_desc,
-                        "chars": len(child_desc),
-                    })
+        if kind in {"table", "column", "measure"}:
+            table_name = name if kind == "table" else parent_table
+            rows.append({
+                "table": table_name,
+                "name": name,
+                "type": _schema_type_label(el_type),
+                "selected": "Yes" if el.get("is_selected") else "No",
+                "description_status": "Configured" if desc else "Missing",
+                "description": desc,
+                "chars": len(desc),
+            })
+            child_parent = name if kind == "table" else parent_table
+            if children:
+                rows.extend(_collect_schema_inventory(children, child_parent))
         elif children:
             # Intermediate node (namespace like "dbo") — recurse
-            rows.extend(_collect_descriptions(children, parent_table))
+            rows.extend(_collect_schema_inventory(children, parent_table))
 
     return rows
+
+
+def _count_omitted_sub_elements(elements):
+    """Count objects whose export says children exist but omits them."""
+    omitted = 0
+    for element in elements:
+        children = element.get("children") or []
+        if (
+            _element_kind(element.get("type", "")) == "table"
+            and element.get("has_sub_elements")
+            and not children
+        ):
+            omitted += 1
+        omitted += _count_omitted_sub_elements(children)
+    return omitted
 
 
 # ──────────────────────────────────────────────────────────
@@ -1274,6 +1595,7 @@ def _render_output(output_str):
     """Render query output as a table if structured, otherwise as text."""
     if not output_str:
         return
+    output_str = _output_text(output_str)
 
     # HV-4: Check for error patterns
     error_patterns = ["error", "exception", "failed", "timeout", "canceled",
@@ -1422,22 +1744,14 @@ def _render_config_metrics(parsed):
 
 def _count_descriptions(elements):
     """Recursively count objects with/without descriptions."""
-    total = with_desc = 0
-    for el in elements:
-        el_type = el.get("type", "")
-        if "table" in el_type or "entity" in el_type:
-            total += 1
-            if el.get("description"):
-                with_desc += 1
-            for child in el.get("children", []):
-                total += 1
-                if child.get("description"):
-                    with_desc += 1
-        elif el.get("children"):
-            sub = _count_descriptions(el["children"])
-            total += sub["total"]
-            with_desc += sub["with_desc"]
-    return {"total": total, "with_desc": with_desc}
+    rows = _collect_schema_inventory(elements)
+    return {
+        "total": len(rows),
+        "with_desc": sum(
+            1 for row in rows
+            if row["description_status"] == "Configured"
+        ),
+    }
 
 
 # ── 2. Schema Quality ────────────────────────────────────
@@ -1504,17 +1818,21 @@ def _build_table_stats(elements):
     rows = []
     for el in elements:
         el_type = el.get("type", "")
-        if "table" in el_type or "entity" in el_type:
+        if _element_kind(el_type) == "table":
             name = el.get("display_name", "?")
             selected = el.get("is_selected", False)
-            children = el.get("children", [])
-
-            cols = [c for c in children if "column" in c.get("type", "")]
-            measures = [c for c in children if "measure" in c.get("type", "")]
-            all_objects = [el] + children  # include table/entity itself
-            with_desc = sum(1 for o in all_objects if o.get("description"))
-            over_200 = sum(1 for o in all_objects if len(_s(o.get("description"))) > THRESHOLDS["desc_char_limit"])
-            total = len(all_objects)
+            object_rows = _collect_schema_inventory([el])
+            cols = [row for row in object_rows if row["type"] == "Column"]
+            measures = [row for row in object_rows if row["type"] == "Measure"]
+            with_desc = sum(
+                1 for row in object_rows
+                if row["description_status"] == "Configured"
+            )
+            over_200 = sum(
+                1 for row in object_rows
+                if row["chars"] > THRESHOLDS["desc_char_limit"]
+            )
+            total = len(object_rows)
             coverage = (with_desc / total * 100) if total > 0 else 0
 
             rows.append({
@@ -2080,10 +2398,11 @@ def render_raw_json_tab(raw):
     sections = list(raw.keys())
     selected = st.selectbox("Section", ["Full file"] + sections)
 
-    if selected == "Full file":
-        st.json(raw)
+    value = raw if selected == "Full file" else raw[selected]
+    if isinstance(value, (dict, list)):
+        st.json(value)
     else:
-        st.json(raw.get(selected, {}))
+        st.code(_json_text(value), language="json")
 
 
 # ──────────────────────────────────────────────────────────
@@ -2204,4 +2523,5 @@ def main():
         """, unsafe_allow_html=True)
 
 
-main()
+if __name__ == "__main__":
+    main()
