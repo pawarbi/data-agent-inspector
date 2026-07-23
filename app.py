@@ -11,6 +11,13 @@ import json
 import html as html_lib
 import pandas as pd
 from datetime import datetime, timezone
+from ai_analysis import (
+    DEFAULT_OPENROUTER_MODEL,
+    ask_openrouter,
+    build_diagnostic_context,
+    build_system_prompt,
+)
+from query_analyzers import analyze_query
 
 # ──────────────────────────────────────────────────────────
 # Configurable Thresholds
@@ -71,6 +78,97 @@ st.markdown("""
 }
 .step-header.failed {
     border-left-color: #e74c3c;
+}
+
+.turn-summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin: 10px 0 8px 0;
+    color: #555;
+    font-size: 13px;
+}
+.turn-summary-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.status-dot {
+    width: 18px;
+    height: 18px;
+    border: 1.5px solid #198754;
+    color: #198754;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    font-weight: 700;
+}
+.status-dot.failed {
+    border-color: #d92d20;
+    color: #d92d20;
+}
+.slow-chip {
+    color: #b42318;
+    background: #fee4e2;
+    border-radius: 999px;
+    padding: 2px 8px;
+    font-weight: 600;
+}
+.execution-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 14px;
+    background: #f8f9fa;
+    border-radius: 6px;
+    border-left: 3px solid #2ecc71;
+    font-size: 14px;
+    line-height: 1.5;
+    margin-bottom: 8px;
+}
+.execution-header.failed {
+    border-left-color: #e74c3c;
+}
+.execution-duration {
+    color: #666;
+    white-space: nowrap;
+    font-size: 12px;
+}
+.review-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+    margin: 6px 0;
+}
+.review-card {
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+    padding: 10px 12px;
+    background: #fbfbfc;
+    min-width: 0;
+}
+.review-card-title {
+    font-weight: 650;
+    font-size: 12px;
+    color: #344054;
+    margin-bottom: 6px;
+}
+.review-item {
+    font-size: 12px;
+    line-height: 1.5;
+    color: #475467;
+    overflow-wrap: anywhere;
+}
+.review-item code {
+    font-size: 11px;
+}
+@media (max-width: 900px) {
+    .review-grid {
+        grid-template-columns: 1fr;
+    }
 }
 
 /* Response time — right-aligned gray */
@@ -337,6 +435,25 @@ def _ts(epoch):
         return None
 
 
+def _parse_json_document(content):
+    """Parse diagnostics JSON, tolerating a single exported filename header."""
+    if isinstance(content, bytes):
+        content = content.decode("utf-8-sig")
+
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as original_error:
+        object_start = content.find("{")
+        prefix = content[:object_start].strip() if object_start >= 0 else ""
+        if (
+            object_start > 0
+            and "\n" not in prefix
+            and prefix.lower().endswith(".json")
+        ):
+            return json.loads(content[object_start:])
+        raise original_error
+
+
 # ──────────────────────────────────────────────────────────
 # Validation
 # ──────────────────────────────────────────────────────────
@@ -416,6 +533,8 @@ def parse_diagnostics(raw):
         )
         fewshot_results = _parse_current_fewshot_loading(current_steps)
         conversations = _parse_current_conversations(raw, current_steps)
+
+    _attach_query_analyses(conversations, data_sources)
 
     return {
         "meta": meta,
@@ -526,7 +645,84 @@ def _parse_data_sources(config, datasources_raw):
             "relationships": relationships,
         })
 
+    experimental = config.get("experimental") or {}
+    for index, search_config in enumerate(
+        experimental.get("azureAISearchConfigs") or []
+    ):
+        search_index = search_config.get("azureAiSearchIndexName", "")
+        search_id = f"azure-ai-search:{search_index or index}"
+        data_sources.append({
+            "id": search_id,
+            "name": (
+                search_config.get("azureAiSearchDisplayName")
+                or search_index
+                or "Azure AI Search"
+            ),
+            "type": "azure_ai_search",
+            "is_selected": True,
+            "selection_state": "Selected",
+            "description": (
+                search_config.get("azureAiSearchUserDescription")
+                or search_config.get("azureAiSearchDescription")
+                or ""
+            ),
+            "instructions": "",
+            "elements": [],
+            "connection": {
+                "endpoint": search_config.get("azureAiSearchEndpoint", ""),
+                "index_name": search_index,
+                "search_type": search_config.get("azureAiSearchSearchType", ""),
+                "top_k": search_config.get("azureAiSearchTopk"),
+            },
+            "few_shot_examples": [],
+            "relationships": [],
+        })
+
     return data_sources
+
+
+def _attach_query_analyses(conversations, data_sources):
+    """Attach deterministic query facts to user-facing execution steps."""
+    sources_by_name = {
+        ds["name"].lower(): ds
+        for ds in data_sources
+        if ds.get("name")
+    }
+    source_types = {
+        "SemanticModel": {"semantic_model"},
+        "LakehouseTable": {
+            "data_warehouse",
+            "lakehouse",
+            "lakehouse_tables",
+            "warehouse",
+            "datawarehouse",
+        },
+        "Kusto": {"kusto"},
+    }
+
+    for conversation in conversations:
+        for step in conversation.get("steps", []):
+            if step.get("source_type") == "Trace" or not step.get("generated_code"):
+                step["query_analysis"] = None
+                continue
+
+            source = sources_by_name.get(
+                (step.get("source_name") or "").lower()
+            )
+            if source is None:
+                expected_types = source_types.get(step.get("source_type"), set())
+                candidates = [
+                    ds for ds in data_sources
+                    if ds.get("type", "").lower() in expected_types
+                ]
+                if len(candidates) == 1:
+                    source = candidates[0]
+
+            step["query_analysis"] = analyze_query(
+                step.get("code_language"),
+                step.get("generated_code"),
+                source.get("elements", []) if source else [],
+            )
 
 
 def _parse_current_reasoning_steps(
@@ -790,7 +986,7 @@ def _parse_run_steps(run_steps, latency_by_step_id=None):
 
 
 def _build_gantt_steps(raw_steps, run_start):
-    """Chain raw_steps sequentially from run_start using latency or fallback durations."""
+    """Build a timeline using real starts when available, otherwise sequence steps."""
     if not run_start or not raw_steps:
         return []
 
@@ -803,8 +999,9 @@ def _build_gantt_steps(raw_steps, run_start):
             duration = lat
         else:
             duration = max(s.get("duration_s", 0) or 0, 0)
-        start = cursor
-        end = cursor + max(duration, 1)
+        created_at = s.get("created_at", 0) or 0
+        start = created_at if created_at >= run_start else cursor
+        end = start + max(duration, 1)
         gantt.append({
             "step_id": s.get("step_id", ""),
             "tool_name": s.get("func_name", "unknown"),
@@ -812,7 +1009,7 @@ def _build_gantt_steps(raw_steps, run_start):
             "end": end,
             "duration_s": duration,
         })
-        cursor = end
+        cursor = max(cursor, end)
     return gantt
 
 
@@ -920,16 +1117,22 @@ def _detect_language(func_name, datasource_type=""):
         "powerbi",
     }:
         return "Dax", "SemanticModel"
+    elif "kusto" in fn or "kql" in fn or ds_type in {
+        "kusto",
+        "kql",
+        "eventhouse",
+    }:
+        return "KQL", "Kusto"
     elif "database" in fn or ds_type in {
         "lakehouse",
         "lakehouse_tables",
         "lakehousetable",
         "database",
+        "datawarehouse",
+        "warehouse",
         "sql",
     }:
         return "SQL", "LakehouseTable"
-    elif "kusto" in fn or "kql" in fn:
-        return "KQL", "Kusto"
     return "Code", ""
 
 
@@ -1094,6 +1297,7 @@ def _render_setup_tab(parsed):
 
         # Data source description (all types)
         is_ontology = ds["type"] == "ontology"
+        is_ai_search = ds["type"] == "azure_ai_search"
         if ds["description"]:
             desc_len = len(ds["description"])
             with st.expander(f"Data source description ({desc_len:,} chars)"):
@@ -1112,6 +1316,11 @@ def _render_setup_tab(parsed):
                 st.markdown(instr_text)
         elif is_ontology:
             st.caption("Data source instructions: N/A (not supported for ontology)")
+        elif is_ai_search:
+            st.caption(
+                "Per-source instructions: N/A. Routing guidance is stored in "
+                "the agent instructions."
+            )
         else:
             with st.expander("Data source instructions"):
                 st.caption("No data source instructions configured")
@@ -1132,8 +1341,10 @@ def _render_setup_tab(parsed):
                         st.code(str(ex))
 
         # Few-shot loading results from run_steps
-        if is_ontology:
-            st.caption("Few-shot examples: N/A (not supported for ontology)")
+        if is_ontology or is_ai_search:
+            st.caption(
+                f"Few-shot examples: N/A (not supported for {ds['type']})"
+            )
         else:
             ds_fewshots = [f for f in fewshot_results if f["datasource_name"] == ds["name"]]
             if ds_fewshots:
@@ -1366,55 +1577,163 @@ def _render_turn(conv):
         with st.container(border=True):
             st.markdown(conv["answer"])
 
-    # ── Step count + response time ──
-    num_steps = len(conv["steps"])
+    primary_steps, trace_steps = _split_review_steps(conv.get("steps", []))
+    num_steps = len(primary_steps)
     resp_time = conv["response_time_s"]
     is_slow = resp_time > THRESHOLDS["slow_turn_s"]
 
-    col1, col2 = st.columns([3, 1])
+    if conv.get("is_cached"):
+        summary_label = "Cached response"
+    elif num_steps:
+        status_label = (
+            "completed"
+            if conv["status"] == "completed"
+            else conv["status"]
+        )
+        summary_label = (
+            f"{num_steps} step{'s' if num_steps != 1 else ''} {status_label}"
+        )
+    elif trace_steps:
+        summary_label = "Technical operations only"
+    else:
+        summary_label = "No data query steps"
 
-    with col2:
-        if resp_time > 0:
-            time_color = "#e74c3c" if is_slow else "#666"
-            slow_label = "SLOW " if is_slow else ""
-            st.markdown(
-                f'<div class="response-time" style="color:{time_color};">'
-                f'{slow_label}{resp_time:.0f}s</div>',
-                unsafe_allow_html=True,
+    time_html = ""
+    if resp_time > 0:
+        if is_slow:
+            time_html = (
+                f'<span class="slow-chip">Slow · {resp_time:.0f}s</span>'
             )
+        else:
+            time_html = f"<span>Response time: {resp_time:.0f}s</span>"
 
-    with col1:
-        if conv.get("is_cached"):
-            st.markdown(
-                '<span style="background:#f0e6ff; color:#7c3aed; padding:4px 10px; '
-                'border-radius:4px; font-size:13px;">Cached response</span>',
-                unsafe_allow_html=True,
-            )
-        elif num_steps > 0:
-            status_label = "completed" if conv["status"] == "completed" else conv["status"]
-            label = f"{num_steps} step{'s' if num_steps != 1 else ''} — {status_label}"
-            with st.expander(label, expanded=is_slow):
-                # Show time breakdown for slow responses
-                if is_slow and num_steps > 0:
-                    _render_time_breakdown(conv)
-                for step in conv["steps"]:
-                    _render_step(step)
+    status_class, status_icon = _turn_status_indicator(conv.get("status"))
+    st.markdown(
+        '<div class="turn-summary">'
+        '<div class="turn-summary-left">'
+        f'<span class="status-dot{status_class}">{status_icon}</span>'
+        f'<span>{html_lib.escape(summary_label)}</span>'
+        '</div>'
+        f'<div>{time_html}</div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
 
-            gantt = conv.get("gantt_steps") or []
+    for step in primary_steps:
+        with st.container(border=True):
+            _render_step(step)
+
+    if not primary_steps and conv["answer"] and not trace_steps:
+        st.caption("Agent answered without a recorded data query.")
+
+    gantt = conv.get("gantt_steps") or []
+    if trace_steps or gantt:
+        detail_count = len(gantt) if gantt else len(trace_steps)
+        label = (
+            f"Technical diagnostics — {detail_count} tool call"
+            f"{'s' if detail_count != 1 else ''}"
+        )
+        with st.expander(label, expanded=False):
+            if is_slow:
+                st.warning(
+                    f"This response took {resp_time:.0f}s. Tool timings may overlap "
+                    "when operations run in parallel."
+                )
             if gantt:
-                gantt_label = f"Latency breakdown — {len(gantt)} tool call{'s' if len(gantt) != 1 else ''}"
-                with st.expander(gantt_label, expanded=is_slow):
-                    _render_turn_latency(conv)
-        elif conv["answer"]:
-            st.caption("No data query steps — agent answered from LLM knowledge")
+                _render_turn_latency(conv)
+            if trace_steps:
+                _render_trace_steps(trace_steps)
 
     st.markdown("---")
 
 
+def _turn_status_indicator(status):
+    """Return CSS class and symbol for a conversation run status."""
+    if status not in ("completed", "unknown", "", None):
+        return " failed", "!"
+    return "", "✓"
+
+
+def _split_review_steps(steps):
+    """Separate user-facing query executions from low-level trace operations."""
+    primary = [
+        step for step in steps
+        if step.get("source_type") != "Trace"
+    ]
+    traces = [
+        step for step in steps
+        if step.get("source_type") == "Trace"
+    ]
+    return primary, traces
+
+
+def _friendly_tool_name(tool_name):
+    """Convert internal function names into compact diagnostic labels."""
+    normalized = (tool_name or "unknown").lower()
+    mappings = [
+        ("fewshots.loading", "Few-shot loading"),
+        ("nl2code", "Query generation"),
+        ("nl2sql", "SQL generation"),
+        ("analyze_semantic_model", "Semantic model analysis"),
+        ("analyze_kusto", "KQL analysis"),
+        ("analyze_lakehouse", "Lakehouse analysis"),
+        ("query_execution", "Query execution"),
+        (".execute", "Query execution"),
+        ("generate.filename", "File-name generation"),
+        ("search_reference_documents", "Reference search"),
+    ]
+    for fragment, label in mappings:
+        if fragment in normalized:
+            return label
+    return (tool_name or "Unknown").replace("_", " ")
+
+
+def _render_trace_steps(trace_steps):
+    """Render low-level traces inside technical diagnostics."""
+    rows = []
+    for trace in trace_steps:
+        rows.append({
+            "Operation": _friendly_tool_name(trace.get("source_name")),
+            "Status": trace.get("status") or "unknown",
+            "Duration (s)": trace.get("duration_s", 0) or 0,
+            "Has output": "Yes" if trace.get("output") else "No",
+        })
+
+    st.markdown("**Trace operations**")
+    st.dataframe(
+        pd.DataFrame(rows),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Operation": st.column_config.TextColumn("Operation", width="large"),
+            "Status": st.column_config.TextColumn("Status", width="small"),
+            "Duration (s)": st.column_config.NumberColumn(
+                "Duration (s)",
+                format="%.1f",
+                width="small",
+            ),
+            "Has output": st.column_config.TextColumn("Output", width="small"),
+        },
+    )
+
+    traces_with_output = [
+        trace for trace in trace_steps
+        if trace.get("output")
+    ]
+    for index, trace in enumerate(traces_with_output, 1):
+        label = _friendly_tool_name(trace.get("source_name"))
+        with st.expander(f"Trace output {index}: {label}"):
+            _render_output(trace["output"])
+
+
 def _render_turn_latency(conv):
     """Per-turn latency breakdown: small Gantt + table of tool calls in time order."""
-    gantt = conv.get("gantt_steps") or []
+    gantt = [
+        step for step in (conv.get("gantt_steps") or [])
+        if (step.get("duration_s", 0) or 0) > 0
+    ]
     if not gantt:
+        st.caption("No non-zero tool timing data was recorded.")
         return
 
     run_start = gantt[0]["start"]
@@ -1422,7 +1741,7 @@ def _render_turn_latency(conv):
     for i, g in enumerate(gantt, 1):
         rows.append({
             "#": i,
-            "Tool": g["tool_name"],
+            "Tool": _friendly_tool_name(g["tool_name"]),
             "Start (s)": max(0, g["start"] - run_start),
             "Duration (s)": g["duration_s"],
         })
@@ -1435,8 +1754,8 @@ def _render_turn_latency(conv):
             timeline_rows = []
             for g in gantt:
                 timeline_rows.append({
-                    "Tool": g["tool_name"],
-                    "Step": f"{g['tool_name']}",
+                    "Tool": _friendly_tool_name(g["tool_name"]),
+                    "Step": _friendly_tool_name(g["tool_name"]),
                     "Start": datetime.fromtimestamp(g["start"], tz=timezone.utc),
                     "Finish": datetime.fromtimestamp(g["end"], tz=timezone.utc),
                     "Duration (s)": g["duration_s"],
@@ -1458,7 +1777,15 @@ def _render_turn_latency(conv):
                 xaxis_title="Time",
                 yaxis_title="",
             )
-            st.plotly_chart(fig, use_container_width=True)
+            chart_key = (
+                f"turn_latency_{conv.get('turn', 'unknown')}_"
+                f"{conv.get('run_id') or 'no_run'}"
+            )
+            st.plotly_chart(
+                fig,
+                use_container_width=True,
+                key=chart_key,
+            )
         except ImportError:
             pass
 
@@ -1481,114 +1808,135 @@ def _render_turn_latency(conv):
     )
 
 
-def _render_time_breakdown(conv):
-    """Show a visual time breakdown for slow responses.
-
-    Aligned with the Gantt: uses per-tool latency durations (when available)
-    instead of raw run_step wall-clock durations, so % of Total agrees with
-    the Latency breakdown / Step Duration Timeline.
-    """
-    total = conv["response_time_s"]
-    gantt = conv.get("gantt_steps") or []
-
-    rows = []
-    gantt_total = 0.0
-    if gantt:
-        # Aggregate per tool so the breakdown stays compact when many steps repeat
-        agg = {}
-        for g in gantt:
-            tool = g.get("tool_name", "unknown")
-            dur = g.get("duration_s", 0) or 0
-            agg[tool] = agg.get(tool, 0) + dur
-            gantt_total += dur
-        for tool, dur in sorted(agg.items(), key=lambda x: -x[1]):
-            pct = (dur / total * 100) if total > 0 else 0
-            rows.append({"Component": tool, "Duration (s)": dur, "% of Total": pct})
-    else:
-        # Fallback to analyze-step breakdown when no Gantt available
-        for s in conv["steps"]:
-            pct = (s["duration_s"] / total * 100) if total > 0 else 0
-            label = s["source_name"] or s["source_type"] or "step"
-            rows.append({
-                "Component": f"{s['code_language']} · {label}",
-                "Duration (s)": s["duration_s"],
-                "% of Total": pct,
-            })
-            gantt_total += s["duration_s"]
-
-    orchestrator = max(0, total - gantt_total)
-    if orchestrator > 0:
-        rows.append({
-            "Component": "Orchestrator (queue + response)",
-            "Duration (s)": orchestrator,
-            "% of Total": (orchestrator / total * 100) if total > 0 else 0,
-        })
-
-    df = pd.DataFrame(rows)
-    pct_sum = df["% of Total"].sum() if not df.empty else 0
-    parallel_note = ""
-    if pct_sum > 110:
-        parallel_note = (
-            " · sum exceeds 100% because some tool calls ran in parallel within the turn"
-        )
-
-    st.markdown(
-        '<div style="background:#fff3cd; border-left:3px solid #f39c12; padding:8px 12px; '
-        'border-radius:4px; margin-bottom:10px; font-size:13px;">'
-        f'<strong>Slow response ({total:.0f}s)</strong> — breakdown by tool (durations from '
-        f'<code>latency.tool_calls</code>{parallel_note}):</div>',
-        unsafe_allow_html=True,
-    )
-    st.dataframe(df, use_container_width=True, hide_index=True,
-                 column_config={
-                     "Duration (s)": st.column_config.NumberColumn("Duration (s)", format="%.1f"),
-                     "% of Total": st.column_config.ProgressColumn(
-                         "% of Total", min_value=0, max_value=max(100, pct_sum), format="%.0f%%"),
-                 })
-    st.markdown("")
-
-
 def _render_step(step):
-    """Render a single analyze step with query code and output."""
-
-    # Step header
+    """Render a Fabric-style execution card with code, result, and review tabs."""
     status_class = "" if step["status"] == "completed" else " failed"
-    is_trace = step["source_type"] == "Trace"
-
-    if is_trace:
-        header_parts = [f'<strong>Trace</strong> · {html_lib.escape(step["source_name"])}']
-    else:
-        header_parts = [f'Analyzed <strong>{html_lib.escape(step["source_name"])}</strong>']
-        if step["source_type"]:
-            header_parts.append(html_lib.escape(step["source_type"]))
+    source_name = step.get("source_name") or step.get("source_type") or "data source"
+    header_parts = [f'Analyzed <strong>{html_lib.escape(source_name)}</strong>']
+    if step.get("source_type"):
+        header_parts.append(html_lib.escape(step["source_type"]))
     if step["nl_query"]:
         header_parts.append(f'for: &ldquo;<em>{html_lib.escape(step["nl_query"][:300])}</em>&rdquo;')
 
+    duration_html = ""
+    if step.get("duration_s", 0) > 0:
+        duration_html = (
+            f'<span class="execution-duration">{step["duration_s"]:.1f}s</span>'
+        )
     st.markdown(
-        f'<div class="step-header{status_class}">{" ".join(header_parts)}</div>',
+        f'<div class="execution-header{status_class}">'
+        f'<div>{" ".join(header_parts)}</div>{duration_html}</div>',
         unsafe_allow_html=True,
     )
 
-    # Query code
-    if step["generated_code"]:
-        with st.expander("Query code"):
-            lang = step["code_language"]
-            lang_class = f"lang-{lang.lower()}"
-            st.markdown(
-                f'<span class="lang-badge {lang_class}">{lang}</span>',
-                unsafe_allow_html=True,
-            )
-            st.code(step["generated_code"], language="sql")
+    tabs = []
+    if step.get("generated_code"):
+        tabs.append(("code", step.get("code_language") or "Code"))
+    if step.get("output"):
+        tabs.append(("result", "Result"))
+    if step.get("query_analysis"):
+        tabs.append(("review", "Review"))
 
-    # Query output / Trace output
-    if step["output"]:
-        label = "Trace output" if is_trace else "Query output"
-        with st.expander(label):
-            _render_output(step["output"])
+    if not tabs:
+        st.caption("No execution details were recorded for this step.")
+        return
 
-    # Duration
-    if step["duration_s"] > 0:
-        st.caption(f"Duration: {step['duration_s']:.1f}s")
+    tab_containers = st.tabs([label for _, label in tabs])
+    for (tab_type, _), tab in zip(tabs, tab_containers):
+        with tab:
+            if tab_type == "code":
+                language = (step.get("code_language") or "text").lower()
+                st.code(step["generated_code"], language=language)
+            elif tab_type == "result":
+                _render_output(step["output"])
+            else:
+                _render_query_review(step["query_analysis"])
+
+
+def _review_value_html(label, values, empty_text="None detected"):
+    """Build one safe review row."""
+    values = values or []
+    if values:
+        visible = values[:20]
+        content = ", ".join(
+            f"<code>{html_lib.escape(str(value))}</code>"
+            for value in visible
+        )
+        if len(values) > len(visible):
+            content += f" <span>+{len(values) - len(visible)} more</span>"
+    else:
+        content = f"<span>{html_lib.escape(empty_text)}</span>"
+    return (
+        '<div class="review-item">'
+        f"<strong>{html_lib.escape(label)}:</strong> {content}</div>"
+    )
+
+
+def _render_query_review(analysis):
+    """Render deterministic structural query facts without claiming correctness."""
+    if not analysis:
+        st.caption("No structural query analysis is available.")
+        return
+
+    parser = analysis.get("parser", "Unknown")
+    confidence = analysis.get("confidence", "Unknown")
+    st.caption(
+        f"Structural extraction only · {parser} · confidence: {confidence}"
+    )
+
+    notes = analysis.get("notes") or []
+    schema_missing = any(
+        "metadata was not exported" in note.lower()
+        for note in notes
+    )
+    schema_empty_text = (
+        "Schema metadata unavailable"
+        if schema_missing
+        else "None detected"
+    )
+    object_card = "".join([
+        _review_value_html("Tables", analysis.get("tables")),
+        _review_value_html(
+            "Columns",
+            analysis.get("columns"),
+            schema_empty_text,
+        ),
+        _review_value_html(
+            "Measures",
+            analysis.get("measures"),
+            schema_empty_text,
+        ),
+        _review_value_html(
+            "Unverified references" if schema_missing else "Unclassified references",
+            analysis.get("other_references"),
+        ),
+    ])
+    behavior_card = "".join([
+        _review_value_html("Filters", analysis.get("filters")),
+        _review_value_html("Joins", analysis.get("joins")),
+        _review_value_html("Aggregations", analysis.get("aggregations")),
+        _review_value_html(
+            "Generated measures",
+            analysis.get("generated_measures"),
+        ),
+    ])
+
+    st.markdown(
+        '<div class="review-grid">'
+        '<div class="review-card">'
+        '<div class="review-card-title">Referenced objects</div>'
+        f"{object_card}</div>"
+        '<div class="review-card">'
+        '<div class="review-card-title">Query behavior</div>'
+        f"{behavior_card}</div>"
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    if analysis.get("parse_error"):
+        st.warning(f"Parser fallback used: {analysis['parse_error']}")
+    for note in notes:
+        st.info(note)
 
 
 def _render_output(output_str):
@@ -2254,16 +2602,17 @@ def _detect_issues(parsed):
         })
 
     # ── Per-source description & instructions ──
-    _NO_DESC_INSTR_TYPES = {"semantic_model", "ontology"}
+    _NO_DESC_TYPES = {"semantic_model", "ontology"}
+    _NO_INSTR_TYPES = {"semantic_model", "ontology", "azure_ai_search"}
     for ds in data_sources:
-        if not ds["description"] and ds["type"] not in _NO_DESC_INSTR_TYPES:
+        if not ds["description"] and ds["type"] not in _NO_DESC_TYPES:
             issues.append({
                 "Severity": "Info",
                 "Category": "Configuration",
                 "Issue": f"'{ds['name']}' has no data source description",
                 "Recommendation": "Add a description to help the agent understand the data source context",
             })
-        if not ds["instructions"] and ds["type"] not in _NO_DESC_INSTR_TYPES:
+        if not ds["instructions"] and ds["type"] not in _NO_INSTR_TYPES:
             issues.append({
                 "Severity": "Info",
                 "Category": "Configuration",
@@ -2406,6 +2755,236 @@ def render_raw_json_tab(raw):
 
 
 # ──────────────────────────────────────────────────────────
+# Experimental AI Analysis
+# ──────────────────────────────────────────────────────────
+
+def _reset_ai_consent():
+    """Require fresh consent after the outbound context or provider changes."""
+    st.session_state["ai_privacy_consent"] = False
+
+
+def render_ai_analysis_tab(raw, parsed):
+    """Render privacy-aware OpenRouter diagnostics analysis."""
+    st.markdown("### Analyze with AI")
+    st.warning(
+        "**Experimental:** AI analysis can be incomplete or wrong. Validate "
+        "findings against source data, model metadata, and current Microsoft "
+        "documentation before making changes."
+    )
+    st.markdown(
+        "Use your own OpenRouter key to review this diagnostic. Nothing is sent "
+        "until you submit a question or start a review."
+    )
+
+    with st.expander("Privacy and data handling", expanded=True):
+        st.markdown(
+            "- The selected context is sent to **OpenRouter and the selected "
+            "model provider**, subject to their privacy, retention, and usage "
+            "policies.\n"
+            "- The API key is used only for the request and is not included in "
+            "the diagnostic context or chat transcript.\n"
+            "- Redaction is best-effort. Review the context preview and do not "
+            "submit secrets, credentials, personal data, or regulated data.\n"
+            "- Diagnostic text is treated as untrusted evidence to reduce "
+            "prompt-injection risk."
+        )
+        st.markdown(
+            "[OpenRouter privacy policy](https://openrouter.ai/privacy) · "
+            "[Microsoft Fabric documentation]"
+            "(https://learn.microsoft.com/en-us/fabric/data-science/concept-data-agent)"
+        )
+
+    settings_col, context_col = st.columns([1, 1])
+    with settings_col:
+        api_key = st.text_input(
+            "OpenRouter API key",
+            type="password",
+            key="openrouter_api_key",
+            help="Kept only in this Streamlit session and sent as an authorization header.",
+        )
+        model = st.text_input(
+            "OpenRouter model",
+            value=DEFAULT_OPENROUTER_MODEL,
+            key="openrouter_model",
+            on_change=_reset_ai_consent,
+            help=(
+                "The default is a capable free reasoning model. Free model "
+                "availability and limits can change."
+            ),
+        ).strip()
+        st.caption(
+            "Default: NVIDIA Nemotron 3 Ultra (free), reasoning-capable with a "
+            "1,000,000-token context window when verified. OpenRouter "
+            "availability and pricing can change."
+        )
+        mode = st.selectbox(
+            "Analysis mode",
+            [
+                "Ask about diagnostics",
+                "Full diagnostic review",
+                "Semantic model AI readiness",
+            ],
+            key="ai_analysis_mode",
+        )
+        reasoning_effort = st.selectbox(
+            "Reasoning effort",
+            ["high", "medium", "low", "none"],
+            index=0,
+            key="ai_reasoning_effort",
+        )
+
+    with context_col:
+        include_raw = st.checkbox(
+            "Include full raw JSON",
+            value=False,
+            key="ai_include_raw",
+            on_change=_reset_ai_consent,
+            help=(
+                "Off by default. The minimized context includes configuration, "
+                "schema inventory, conversations, queries, outputs, and timings."
+            ),
+        )
+        redact = st.checkbox(
+            "Redact secrets, URLs, and identifiers",
+            value=True,
+            key="ai_redact_context",
+            on_change=_reset_ai_consent,
+        )
+        consent = st.checkbox(
+            "I reviewed the context and agree to send it to OpenRouter",
+            value=False,
+            key="ai_privacy_consent",
+        )
+        if include_raw:
+            st.warning(
+                "Full raw JSON can contain sensitive questions, query results, "
+                "identifiers, endpoints, and configuration."
+            )
+
+    context_source = dict(parsed)
+    context_source["detected_issues"] = _detect_issues(parsed)
+    context = build_diagnostic_context(
+        raw,
+        context_source,
+        include_raw=include_raw,
+        redact=redact,
+    )
+    st.caption(
+        f"Context prepared for the model: {len(context):,} characters "
+        f"(approximately {max(1, len(context) // 4):,} tokens)."
+    )
+    if len(context) // 4 > 100_000:
+        st.info(
+            "This is a large context. Confirm the selected model supports the "
+            "estimated input plus response tokens."
+        )
+    with st.expander("Preview exactly what will be sent as diagnostic context"):
+        st.text_area(
+            "Diagnostic context",
+            value=context,
+            height=320,
+            disabled=True,
+            key="ai_context_preview",
+            label_visibility="collapsed",
+        )
+
+    previous_mode = st.session_state.get("_ai_previous_mode")
+    if previous_mode is not None and previous_mode != mode:
+        st.session_state["ai_messages"] = []
+    st.session_state["_ai_previous_mode"] = mode
+    messages = st.session_state.setdefault("ai_messages", [])
+
+    action_col, clear_col = st.columns([3, 1])
+    preset_prompt = None
+    with action_col:
+        if mode == "Full diagnostic review":
+            if st.button(
+                "Run full diagnostic review",
+                type="primary",
+                use_container_width=True,
+            ):
+                preset_prompt = (
+                    "Perform a complete evidence-based diagnostic review. "
+                    "Prioritize likely root causes, configuration and query "
+                    "issues, latency, missing evidence, and safe next tests."
+                )
+        elif mode == "Semantic model AI readiness":
+            if st.button(
+                "Assess semantic model AI readiness",
+                type="primary",
+                use_container_width=True,
+            ):
+                preset_prompt = (
+                    "Assess every exported semantic model for AI readiness. "
+                    "Use the ordered readiness checklist, show Pass/Warning/"
+                    "Fail/Not assessable, cite evidence paths, and give the "
+                    "appropriate TOM/MCP, PBIP/Prep for AI, or manual remediation."
+                )
+        else:
+            st.caption(
+                "Ask about routing, generated queries, schema, configuration, "
+                "answers, latency, limitations, or readiness."
+            )
+    with clear_col:
+        if st.button("Clear chat", use_container_width=True):
+            st.session_state["ai_messages"] = []
+            st.rerun()
+
+    for message in messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    chat_prompt = st.chat_input(
+        "Ask a question about this diagnostic JSON",
+        key="ai_chat_input",
+    )
+    submitted_prompt = preset_prompt or chat_prompt
+    if not submitted_prompt:
+        return
+    if not api_key:
+        st.error("Enter an OpenRouter API key before submitting.")
+        return
+    if not model:
+        st.error("Enter an OpenRouter model ID before submitting.")
+        return
+    if not consent:
+        st.error("Review the context and confirm the privacy consent first.")
+        return
+
+    request_messages = messages + [{
+        "role": "user",
+        "content": submitted_prompt,
+    }]
+    with st.chat_message("user"):
+        st.markdown(submitted_prompt)
+
+    try:
+        with st.spinner("Analyzing diagnostics with OpenRouter..."):
+            response = ask_openrouter(
+                api_key=api_key,
+                model=model,
+                system_prompt=build_system_prompt(mode),
+                diagnostic_context=context,
+                messages=request_messages[-12:],
+                reasoning_effort=reasoning_effort,
+            )
+    except Exception as exc:
+        st.error(str(exc))
+        return
+
+    messages.append({
+        "role": "user",
+        "content": submitted_prompt,
+    })
+    messages.append({
+        "role": "assistant",
+        "content": response,
+    })
+    with st.chat_message("assistant"):
+        st.markdown(response)
+
+
+# ──────────────────────────────────────────────────────────
 # Entry Point
 # ──────────────────────────────────────────────────────────
 
@@ -2467,7 +3046,7 @@ def main():
             file_key = f"{uploaded.name}_{uploaded.size}"
             if st.session_state.get("_file_key") != file_key:
                 try:
-                    raw = json.load(uploaded)
+                    raw = _parse_json_document(uploaded.getvalue())
                 except json.JSONDecodeError:
                     st.error("Invalid JSON file. Please check the file format.")
                     return
@@ -2489,17 +3068,32 @@ def main():
                 st.session_state["parsed"] = parsed
                 st.session_state["raw"] = raw
                 st.session_state["_file_key"] = file_key
+                st.session_state["ai_messages"] = []
+                st.session_state["ai_privacy_consent"] = False
+                st.session_state.pop("_ai_previous_mode", None)
 
             if "parsed" in st.session_state:
                 render_sidebar(st.session_state["parsed"])
         else:
             # Clear state when file is removed
-            for key in ["parsed", "raw", "_file_key"]:
+            for key in [
+                "parsed",
+                "raw",
+                "_file_key",
+                "ai_messages",
+                "ai_privacy_consent",
+                "_ai_previous_mode",
+            ]:
                 st.session_state.pop(key, None)
 
     # ── Main content ──
     if "parsed" in st.session_state:
-        tab_conv, tab_analysis, tab_json = st.tabs(["Conversation", "Analysis", "Raw JSON"])
+        tab_conv, tab_analysis, tab_json, tab_ai = st.tabs([
+            "Conversation",
+            "Analysis",
+            "Raw JSON",
+            "Analyze with AI (Experimental)",
+        ])
 
         with tab_conv:
             render_main(st.session_state["parsed"])
@@ -2509,6 +3103,12 @@ def main():
 
         with tab_json:
             render_raw_json_tab(st.session_state["raw"])
+
+        with tab_ai:
+            render_ai_analysis_tab(
+                st.session_state["raw"],
+                st.session_state["parsed"],
+            )
     else:
         st.markdown("""
         <div class="welcome">
