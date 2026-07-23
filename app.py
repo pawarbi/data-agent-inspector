@@ -2802,6 +2802,11 @@ def render_ai_analysis_tab(raw, parsed):
             key="openrouter_api_key",
             help="Kept only in this Streamlit session and sent as an authorization header.",
         )
+        st.markdown(
+            "[Create or manage an OpenRouter API key]"
+            "(https://openrouter.ai/keys) · "
+            "[Browse OpenRouter models](https://openrouter.ai/models)"
+        )
         model = st.text_input(
             "OpenRouter model",
             value=DEFAULT_OPENROUTER_MODEL,
