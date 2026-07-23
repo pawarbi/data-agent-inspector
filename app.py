@@ -2771,12 +2771,11 @@ def render_ai_analysis_tab(raw, parsed):
         "findings against source data, model metadata, and current Microsoft "
         "documentation before making changes."
     )
-    st.markdown(
-        "Use your own OpenRouter key to review this diagnostic. Nothing is sent "
-        "until you submit a question or start a review."
+    st.caption(
+        "Nothing is sent until you submit a question or start a review."
     )
 
-    with st.expander("Privacy and data handling", expanded=True):
+    with st.expander("Privacy and data handling"):
         st.markdown(
             "- The selected context is sent to **OpenRouter and the selected "
             "model provider**, subject to their privacy, retention, and usage "
@@ -2802,14 +2801,10 @@ def render_ai_analysis_tab(raw, parsed):
             key="openrouter_api_key",
             help="Kept only in this Streamlit session and sent as an authorization header.",
         )
-        st.markdown(
+        st.caption(
             "[Create or manage an OpenRouter API key]"
             "(https://openrouter.ai/keys) · "
             "[Browse OpenRouter models](https://openrouter.ai/models)"
-        )
-        st.caption(
-            "Use your own dedicated key with a low credit limit. Never share "
-            "or embed a personal OpenRouter key in the app."
         )
         model = st.text_input(
             "OpenRouter model",
