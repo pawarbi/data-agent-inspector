@@ -292,11 +292,165 @@ st.markdown("""
 
 /* Welcome screen */
 .welcome {
-    text-align: center;
-    padding: 80px 20px;
-    color: #555;
+    max-width: 1120px;
+    margin: 0 auto;
+    padding: 38px 24px 56px;
+    color: #344054;
 }
-.welcome h1 { font-size: 2em; margin-bottom: 8px; }
+.welcome-hero {
+    max-width: 760px;
+    margin: 0 auto 32px;
+    text-align: center;
+}
+.welcome-eyebrow {
+    color: #475f9e;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 1.2px;
+    text-transform: uppercase;
+    margin-bottom: 10px;
+}
+.welcome h1 {
+    color: #1a2744;
+    font-size: clamp(28px, 3vw, 40px);
+    line-height: 1.15;
+    margin: 0 0 12px;
+}
+.welcome-lead {
+    color: #667085;
+    font-size: 16px;
+    line-height: 1.55;
+    margin: 0 auto;
+}
+.welcome-start {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 20px;
+    padding: 9px 14px;
+    border: 1px solid #cdd5e7;
+    border-radius: 999px;
+    background: #f7f8fc;
+    color: #25365f;
+    font-size: 13px;
+    font-weight: 650;
+}
+.welcome-start-arrow {
+    color: #4767b2;
+    font-size: 16px;
+}
+.welcome-section-label {
+    color: #667085;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.9px;
+    text-transform: uppercase;
+    margin: 0 0 10px;
+}
+.welcome-flow {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+    margin-bottom: 28px;
+}
+.welcome-step {
+    display: flex;
+    gap: 12px;
+    padding: 16px;
+    border: 1px solid #e2e6ef;
+    border-radius: 10px;
+    background: #ffffff;
+}
+.welcome-step-number {
+    width: 28px;
+    height: 28px;
+    flex: 0 0 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    background: #eaf0ff;
+    color: #3156a3;
+    font-size: 12px;
+    font-weight: 750;
+}
+.welcome-step-title {
+    color: #1d2939;
+    font-size: 14px;
+    font-weight: 700;
+    margin-bottom: 3px;
+}
+.welcome-step-text {
+    color: #667085;
+    font-size: 12.5px;
+    line-height: 1.45;
+}
+.welcome-capabilities {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 12px;
+    margin-top: 4px;
+}
+.welcome-capability {
+    min-height: 112px;
+    padding: 15px 16px;
+    border: 1px solid #e2e6ef;
+    border-radius: 8px;
+    background: #fafbfc;
+}
+.welcome-capability-title {
+    color: #1d2939;
+    font-size: 13px;
+    font-weight: 700;
+    margin-bottom: 4px;
+}
+.welcome-capability-text {
+    color: #667085;
+    font-size: 12px;
+    line-height: 1.45;
+}
+.welcome-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    margin-top: 22px;
+    padding-top: 16px;
+    border-top: 1px solid #e6e9f0;
+    color: #667085;
+    font-size: 12px;
+}
+.welcome-sources {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+.welcome-chip {
+    padding: 4px 8px;
+    border-radius: 5px;
+    background: #eef1f6;
+    color: #475467;
+    font-size: 11px;
+}
+@media (max-width: 900px) {
+    .welcome-flow,
+    .welcome-capabilities {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+@media (max-width: 640px) {
+    .welcome {
+        padding: 26px 8px 40px;
+    }
+    .welcome-flow,
+    .welcome-capabilities {
+        grid-template-columns: 1fr;
+    }
+    .welcome-footer {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+}
 
 /* Schema child indent */
 .schema-child {
@@ -3035,6 +3189,99 @@ def _render_banner():
     """, unsafe_allow_html=True)
 
 
+def _render_welcome():
+    """Render the compact onboarding page shown before a file is uploaded."""
+    st.markdown("""<div class="welcome">
+        <div class="welcome-hero">
+            <div class="welcome-eyebrow">Fabric Data Agent Diagnostics</div>
+            <h1>Analyze Fabric Data Agent</h1>
+            <p class="welcome-lead">
+                Upload a diagnostics JSON file to inspect configuration,
+                generated queries, execution results, schema readiness,
+                failures, and latency.
+            </p>
+            <div class="welcome-start">
+                <span class="welcome-start-arrow">&larr;</span>
+                Upload a diagnostics JSON file in the sidebar
+            </div>
+        </div>
+        <div class="welcome-section-label">How it works</div>
+        <div class="welcome-flow">
+            <div class="welcome-step">
+                <div class="welcome-step-number">1</div>
+                <div>
+                    <div class="welcome-step-title">Export diagnostics</div>
+                    <div class="welcome-step-text">
+                        Download the diagnostics JSON from your Fabric data
+                        agent session.
+                    </div>
+                </div>
+            </div>
+            <div class="welcome-step">
+                <div class="welcome-step-number">2</div>
+                <div>
+                    <div class="welcome-step-title">Upload and inspect</div>
+                    <div class="welcome-step-text">
+                        Review conversation turns, source routing, generated
+                        DAX, SQL or KQL, results, and timing.
+                    </div>
+                </div>
+            </div>
+            <div class="welcome-step">
+                <div class="welcome-step-number">3</div>
+                <div>
+                    <div class="welcome-step-title">Find the next fix</div>
+                    <div class="welcome-step-text">
+                        Use evidence-based findings to improve schema,
+                        instructions, queries, and agent configuration.
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="welcome-section-label">What you can investigate</div>
+        <div class="welcome-capabilities">
+            <div class="welcome-capability">
+                <div class="welcome-capability-title">Conversation and queries</div>
+                <div class="welcome-capability-text">
+                    Compare questions, paraphrasing, source selection, generated
+                    code, outputs, and final answers turn by turn.
+                </div>
+            </div>
+            <div class="welcome-capability">
+                <div class="welcome-capability-title">Setup and schema</div>
+                <div class="welcome-capability-text">
+                    Inspect tables, columns, measures, descriptions,
+                    instructions, few-shot examples, and AI Search setup.
+                </div>
+            </div>
+            <div class="welcome-capability">
+                <div class="welcome-capability-title">Failures and performance</div>
+                <div class="welcome-capability-text">
+                    Identify failed operations, slow turns, execution
+                    bottlenecks, and missing diagnostic evidence.
+                </div>
+            </div>
+            <div class="welcome-capability">
+                <div class="welcome-capability-title">AI-assisted review</div>
+                <div class="welcome-capability-text">
+                    Optionally use OpenRouter for diagnostic Q&amp;A, full
+                    reviews, and semantic-model AI readiness.
+                </div>
+            </div>
+        </div>
+        <div class="welcome-footer">
+            <div class="welcome-sources">
+                <span class="welcome-chip">Semantic models</span>
+                <span class="welcome-chip">Lakehouse SQL</span>
+                <span class="welcome-chip">KQL databases</span>
+                <span class="welcome-chip">Ontology</span>
+                <span class="welcome-chip">Azure AI Search</span>
+            </div>
+            <div>Local analysis by default. External AI is optional.</div>
+        </div>
+    </div>""", unsafe_allow_html=True)
+
+
 def main():
     _render_banner()
     # ── Sidebar ──
@@ -3114,17 +3361,7 @@ def main():
                 st.session_state["parsed"],
             )
     else:
-        st.markdown("""
-        <div class="welcome">
-            <h1>Agent Inspector</h1>
-            <p>Upload a diagnostics JSON file using the sidebar to begin analysis.</p>
-            <p style="font-size: 14px; margin-top: 16px; color: #888;">
-                Supports Semantic Models, Lakehouse Tables, KQL Databases, Ontology (Graph), and more.<br>
-                Few-shot examples, per-source connection details, descriptions and instructions for all source types.<br>
-                The Explorer panel shows data sources, schema, instructions, and few-shot status.
-            </p>
-        </div>
-        """, unsafe_allow_html=True)
+        _render_welcome()
 
 
 if __name__ == "__main__":

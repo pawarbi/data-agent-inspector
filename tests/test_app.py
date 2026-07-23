@@ -298,6 +298,19 @@ class DiagnosticsCompatibilityTests(unittest.TestCase):
         self.assertEqual(search_source["name"], "support-transcripts")
         self.assertEqual(search_source["connection"]["top_k"], 10)
 
+    def test_welcome_page_explains_workflow_and_core_features(self):
+        with patch("app.st.markdown") as markdown:
+            app._render_welcome()
+
+        content = markdown.call_args.args[0]
+        self.assertIn("How it works", content)
+        self.assertIn("Analyze Fabric Data Agent", content)
+        self.assertIn("Conversation and queries", content)
+        self.assertIn("Setup and schema", content)
+        self.assertIn("Failures and performance", content)
+        self.assertIn("AI-assisted review", content)
+        self.assertTrue(markdown.call_args.kwargs["unsafe_allow_html"])
+
 
 if __name__ == "__main__":
     unittest.main()
