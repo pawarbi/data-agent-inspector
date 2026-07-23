@@ -356,6 +356,9 @@ st.markdown("""
     font-weight: 650;
     box-shadow: none;
 }
+[data-testid="stMain"] [data-testid="stFileUploader"] button > * {
+    display: none;
+}
 [data-testid="stMain"] [data-testid="stFileUploader"] button::before {
     content: "\\2191";
     margin-right: 8px;
