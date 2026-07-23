@@ -297,9 +297,15 @@ st.markdown("""
     padding: 38px 24px 56px;
     color: #344054;
 }
+.welcome-hero-shell {
+    padding-bottom: 0;
+}
+.welcome-details {
+    padding-top: 28px;
+}
 .welcome-hero {
     max-width: 760px;
-    margin: 0 auto 32px;
+    margin: 0 auto;
     text-align: center;
 }
 .welcome-eyebrow {
@@ -322,22 +328,48 @@ st.markdown("""
     line-height: 1.55;
     margin: 0 auto;
 }
-.welcome-start {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    margin-top: 20px;
-    padding: 9px 14px;
+/* Main-page uploader styled as the welcome action. */
+[data-testid="stMain"] [data-testid="stFileUploader"] {
+    max-width: 380px;
+    margin: 18px auto 0;
+}
+[data-testid="stMain"] [data-testid="stFileUploader"] > label,
+[data-testid="stMain"] [data-testid="stFileUploader"] small,
+[data-testid="stMain"] [data-testid="stFileUploaderDropzoneInstructions"] {
+    display: none;
+}
+[data-testid="stMain"] [data-testid="stFileUploader"] section {
+    min-height: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+}
+[data-testid="stMain"] [data-testid="stFileUploader"] button {
+    width: 100%;
+    min-height: 46px;
+    padding: 9px 18px;
     border: 1px solid #cdd5e7;
     border-radius: 999px;
     background: #f7f8fc;
     color: #25365f;
-    font-size: 13px;
+    font-size: 0;
     font-weight: 650;
+    box-shadow: none;
 }
-.welcome-start-arrow {
+[data-testid="stMain"] [data-testid="stFileUploader"] button::before {
+    content: "\\2191";
+    margin-right: 8px;
     color: #4767b2;
     font-size: 16px;
+}
+[data-testid="stMain"] [data-testid="stFileUploader"] button::after {
+    content: "Upload a diagnostics JSON file";
+    font-size: 13px;
+}
+[data-testid="stMain"] [data-testid="stFileUploader"] button:hover {
+    border-color: #8fa3ce;
+    background: #eef2fa;
+    color: #1a2744;
 }
 .welcome-section-label {
     color: #667085;
@@ -3191,7 +3223,7 @@ def _render_banner():
 
 def _render_welcome():
     """Render the compact onboarding page shown before a file is uploaded."""
-    st.markdown("""<div class="welcome">
+    st.markdown("""<div class="welcome welcome-hero-shell">
         <div class="welcome-hero">
             <div class="welcome-eyebrow">Fabric Data Agent Diagnostics</div>
             <h1>Analyze Fabric Data Agent</h1>
@@ -3200,11 +3232,17 @@ def _render_welcome():
                 generated queries, execution results, schema readiness,
                 failures, and latency.
             </p>
-            <div class="welcome-start">
-                <span class="welcome-start-arrow">&larr;</span>
-                Upload a diagnostics JSON file in the sidebar
-            </div>
         </div>
+    </div>""", unsafe_allow_html=True)
+
+    uploaded = st.file_uploader(
+        "Upload a diagnostics JSON file",
+        type=["json"],
+        key="welcome_upload",
+        label_visibility="collapsed",
+    )
+
+    st.markdown("""<div class="welcome welcome-details">
         <div class="welcome-section-label">How it works</div>
         <div class="welcome-flow">
             <div class="welcome-step">
@@ -3280,62 +3318,89 @@ def _render_welcome():
             <div>Local analysis by default. External AI is optional.</div>
         </div>
     </div>""", unsafe_allow_html=True)
+    return uploaded
+
+
+_DIAGNOSTIC_STATE_KEYS = [
+    "parsed",
+    "raw",
+    "_file_key",
+    "_upload_source",
+    "ai_messages",
+    "ai_privacy_consent",
+    "_ai_previous_mode",
+]
+
+
+def _clear_diagnostics_state():
+    """Clear the loaded diagnostic while preserving provider preferences."""
+    for key in _DIAGNOSTIC_STATE_KEYS:
+        st.session_state.pop(key, None)
+
+
+def _load_uploaded_file(uploaded, source):
+    """Parse an uploaded diagnostic and store it in the active session."""
+    if uploaded is None:
+        return False
+
+    file_mb = uploaded.size / (1024 * 1024)
+    if file_mb > THRESHOLDS["max_file_mb"]:
+        st.warning(f"Large file ({file_mb:.0f} MB). Parsing may be slow.")
+
+    file_key = f"{uploaded.name}_{uploaded.size}"
+    if (
+        st.session_state.get("_file_key") == file_key
+        and "parsed" in st.session_state
+    ):
+        st.session_state["_upload_source"] = source
+        return True
+
+    try:
+        raw = _parse_json_document(uploaded.getvalue())
+    except json.JSONDecodeError:
+        st.error("Invalid JSON file. Please check the file format.")
+        return False
+    except Exception as exc:
+        st.error(f"Error reading file: {exc}")
+        return False
+
+    ok, err = validate_diagnostics(raw)
+    if not ok:
+        st.error(f"{err}")
+        return False
+
+    try:
+        parsed = parse_diagnostics(raw)
+    except Exception as exc:
+        st.error(f"Error parsing diagnostics: {exc}")
+        return False
+
+    st.session_state["parsed"] = parsed
+    st.session_state["raw"] = raw
+    st.session_state["_file_key"] = file_key
+    st.session_state["_upload_source"] = source
+    st.session_state["ai_messages"] = []
+    st.session_state["ai_privacy_consent"] = False
+    st.session_state.pop("_ai_previous_mode", None)
+    return True
 
 
 def main():
     _render_banner()
     # ── Sidebar ──
     with st.sidebar:
-        uploaded = st.file_uploader("Upload diagnostics JSON", type=["json"])
+        uploaded = st.file_uploader(
+            "Upload diagnostics JSON",
+            type=["json"],
+            key="sidebar_upload",
+        )
+        if uploaded is not None:
+            _load_uploaded_file(uploaded, "sidebar")
+        elif st.session_state.get("_upload_source") == "sidebar":
+            _clear_diagnostics_state()
 
-        if uploaded:
-            # BF-4: File size check
-            file_mb = uploaded.size / (1024 * 1024)
-            if file_mb > THRESHOLDS["max_file_mb"]:
-                st.warning(f"Large file ({file_mb:.0f} MB). Parsing may be slow.")
-
-            file_key = f"{uploaded.name}_{uploaded.size}"
-            if st.session_state.get("_file_key") != file_key:
-                try:
-                    raw = _parse_json_document(uploaded.getvalue())
-                except json.JSONDecodeError:
-                    st.error("Invalid JSON file. Please check the file format.")
-                    return
-                except Exception as e:
-                    st.error(f"Error reading file: {e}")
-                    return
-
-                ok, err = validate_diagnostics(raw)
-                if not ok:
-                    st.error(f"{err}")
-                    return
-
-                try:
-                    parsed = parse_diagnostics(raw)
-                except Exception as e:
-                    st.error(f"Error parsing diagnostics: {e}")
-                    return
-
-                st.session_state["parsed"] = parsed
-                st.session_state["raw"] = raw
-                st.session_state["_file_key"] = file_key
-                st.session_state["ai_messages"] = []
-                st.session_state["ai_privacy_consent"] = False
-                st.session_state.pop("_ai_previous_mode", None)
-
-            if "parsed" in st.session_state:
-                render_sidebar(st.session_state["parsed"])
-        else:
-            # Clear state when file is removed
-            for key in [
-                "parsed",
-                "raw",
-                "_file_key",
-                "ai_messages",
-                "ai_privacy_consent",
-                "_ai_previous_mode",
-            ]:
-                st.session_state.pop(key, None)
+        if "parsed" in st.session_state:
+            render_sidebar(st.session_state["parsed"])
 
     # ── Main content ──
     if "parsed" in st.session_state:
@@ -3361,7 +3426,9 @@ def main():
                 st.session_state["parsed"],
             )
     else:
-        _render_welcome()
+        uploaded = _render_welcome()
+        if _load_uploaded_file(uploaded, "welcome"):
+            st.rerun()
 
 
 if __name__ == "__main__":

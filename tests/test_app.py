@@ -299,17 +299,78 @@ class DiagnosticsCompatibilityTests(unittest.TestCase):
         self.assertEqual(search_source["connection"]["top_k"], 10)
 
     def test_welcome_page_explains_workflow_and_core_features(self):
-        with patch("app.st.markdown") as markdown:
-            app._render_welcome()
+        uploaded = object()
+        with (
+            patch("app.st.markdown") as markdown,
+            patch(
+                "app.st.file_uploader",
+                return_value=uploaded,
+            ) as file_uploader,
+        ):
+            result = app._render_welcome()
 
-        content = markdown.call_args.args[0]
+        content = "\n".join(call.args[0] for call in markdown.call_args_list)
         self.assertIn("How it works", content)
         self.assertIn("Analyze Fabric Data Agent", content)
         self.assertIn("Conversation and queries", content)
         self.assertIn("Setup and schema", content)
         self.assertIn("Failures and performance", content)
         self.assertIn("AI-assisted review", content)
-        self.assertTrue(markdown.call_args.kwargs["unsafe_allow_html"])
+        self.assertTrue(all(
+            call.kwargs["unsafe_allow_html"]
+            for call in markdown.call_args_list
+        ))
+        self.assertIs(result, uploaded)
+        self.assertEqual(
+            file_uploader.call_args.kwargs["key"],
+            "welcome_upload",
+        )
+
+    def test_uploaded_file_can_be_loaded_from_welcome_page(self):
+        class UploadedFileStub:
+            name = "diagnostics.json"
+            size = 2
+
+            @staticmethod
+            def getvalue():
+                return b"{}"
+
+        class StreamlitStub:
+            def __init__(self):
+                self.session_state = {}
+                self.errors = []
+                self.warnings = []
+
+            def error(self, message):
+                self.errors.append(message)
+
+            def warning(self, message):
+                self.warnings.append(message)
+
+        streamlit_stub = StreamlitStub()
+        parsed = {
+            "meta": {},
+            "data_sources": [],
+            "conversations": [],
+        }
+        with (
+            patch.object(app, "st", streamlit_stub),
+            patch.object(app, "_parse_json_document", return_value={}),
+            patch.object(app, "validate_diagnostics", return_value=(True, "")),
+            patch.object(app, "parse_diagnostics", return_value=parsed),
+        ):
+            loaded = app._load_uploaded_file(
+                UploadedFileStub(),
+                "welcome",
+            )
+
+        self.assertTrue(loaded)
+        self.assertIs(streamlit_stub.session_state["parsed"], parsed)
+        self.assertEqual(
+            streamlit_stub.session_state["_upload_source"],
+            "welcome",
+        )
+        self.assertFalse(streamlit_stub.errors)
 
 
 if __name__ == "__main__":
