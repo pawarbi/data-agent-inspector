@@ -377,7 +377,7 @@ def ask_openrouter(
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
                 "HTTP-Referer": "https://data-agent-inspector.streamlit.app/",
-                "X-Title": "Agent Inspector",
+                "X-OpenRouter-Title": "Agent Inspector",
             },
             json=body,
             timeout=timeout,

@@ -2807,6 +2807,10 @@ def render_ai_analysis_tab(raw, parsed):
             "(https://openrouter.ai/keys) · "
             "[Browse OpenRouter models](https://openrouter.ai/models)"
         )
+        st.caption(
+            "Use your own dedicated key with a low credit limit. Never share "
+            "or embed a personal OpenRouter key in the app."
+        )
         model = st.text_input(
             "OpenRouter model",
             value=DEFAULT_OPENROUTER_MODEL,
