@@ -112,6 +112,10 @@ class DiagnosticsCompatibilityTests(unittest.TestCase):
             parsed["data_sources"][0]["connection"]["semantic_model_name"],
             "Sales model",
         )
+        self.assertEqual(
+            parsed["conversations"][0]["steps"][0]["query_analysis"]["language"],
+            "DAX",
+        )
 
     def test_raw_json_scalar_serialization_is_valid_json(self):
         values = [
@@ -124,6 +128,15 @@ class DiagnosticsCompatibilityTests(unittest.TestCase):
         for value in values:
             with self.subTest(value=value):
                 self.assertEqual(json.loads(app._json_text(value)), value)
+
+    def test_json_export_with_filename_header_is_supported(self):
+        raw = app._parse_json_document(
+            "diagnostics-example.json\n"
+            '{"config": {}, "thread": {}}'
+        )
+
+        self.assertIn("config", raw)
+        self.assertIn("thread", raw)
 
     def test_raw_json_tab_uses_code_renderer_for_scalar_sections(self):
         class StreamlitStub:
@@ -209,6 +222,94 @@ class DiagnosticsCompatibilityTests(unittest.TestCase):
         }]
 
         self.assertEqual(app._count_schema(elements), (1, 1, 0, 0))
+
+    def test_kusto_execution_is_classified_as_kql(self):
+        self.assertEqual(
+            app._detect_language("analyze.database.execute", "Kusto"),
+            ("KQL", "Kusto"),
+        )
+
+    def test_review_steps_hide_trace_operations(self):
+        primary, traces = app._split_review_steps([
+            {"source_type": "SemanticModel"},
+            {"source_type": "Trace"},
+        ])
+
+        self.assertEqual(len(primary), 1)
+        self.assertEqual(len(traces), 1)
+
+    def test_failed_turn_uses_failure_indicator(self):
+        self.assertEqual(app._turn_status_indicator("failed"), (" failed", "!"))
+        self.assertEqual(app._turn_status_indicator("completed"), ("", "✓"))
+
+    def test_gantt_uses_recorded_starts_for_parallel_steps(self):
+        gantt = app._build_gantt_steps([
+            {
+                "step_id": "one",
+                "func_name": "first",
+                "created_at": 101,
+                "duration_s": 5,
+                "latency_duration_s": 5,
+                "order": 1,
+            },
+            {
+                "step_id": "two",
+                "func_name": "second",
+                "created_at": 101,
+                "duration_s": 5,
+                "latency_duration_s": 5,
+                "order": 2,
+            },
+        ], 100)
+
+        self.assertEqual(gantt[0]["start"], 101)
+        self.assertEqual(gantt[1]["start"], 101)
+
+    def test_ai_search_experimental_config_becomes_setup_source(self):
+        raw = {
+            "config": {
+                "configuration": {
+                    "dataSources": [],
+                    "additionalInstructions": "",
+                    "experimental": {
+                        "azureAISearchConfigs": [{
+                            "azureAiSearchIndexName": "support-transcripts",
+                            "azureAiSearchEndpoint": "https://example.search.windows.net",
+                            "azureAiSearchUserDescription": "",
+                            "azureAiSearchSearchType": "semantic",
+                            "azureAiSearchTopk": 10,
+                        }],
+                    },
+                },
+            },
+            "datasources": {},
+            "thread": {
+                "messages": [],
+                "runs": [],
+                "run_steps": [],
+            },
+            "latency": {},
+        }
+
+        parsed = app.parse_diagnostics(raw)
+        search_source = parsed["data_sources"][0]
+
+        self.assertEqual(search_source["type"], "azure_ai_search")
+        self.assertEqual(search_source["name"], "support-transcripts")
+        self.assertEqual(search_source["connection"]["top_k"], 10)
+
+    def test_welcome_page_explains_workflow_and_core_features(self):
+        with patch("app.st.markdown") as markdown:
+            app._render_welcome()
+
+        content = markdown.call_args.args[0]
+        self.assertIn("How it works", content)
+        self.assertIn("Analyze Fabric Data Agent", content)
+        self.assertIn("Conversation and queries", content)
+        self.assertIn("Setup and schema", content)
+        self.assertIn("Failures and performance", content)
+        self.assertIn("AI-assisted review", content)
+        self.assertTrue(markdown.call_args.kwargs["unsafe_allow_html"])
 
 
 if __name__ == "__main__":

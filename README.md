@@ -2,21 +2,27 @@
 
 A diagnostic analyzer for Microsoft Fabric Data Agent. Upload a diagnostics JSON file and visually inspect agent configuration, conversation turns, generated queries, latency, and automated issue detection.
 
-**Your data isn't shared or sent anywhere and is analyzed in your browser. However, always exercise caution of your logs contain sensitive information.**
+Diagnostics are analyzed locally unless you explicitly use the experimental
+OpenRouter feature. AI analysis sends the previewed context to OpenRouter and
+the selected model provider. Always review the context and avoid submitting
+secrets, personal data, or regulated data.
 
 https://data-agent-inspector.streamlit.app/
 
 ## Features
 
 - **Conversation Viewer** -- Browse user/assistant exchanges with generated DAX, SQL, KQL, and GQL queries, execution outputs, and step-by-step trace details.
+- **Query Review** -- Deterministically extracts referenced objects, filters, joins, aggregations, and generated measures from DAX, SQL, and KQL without claiming business correctness.
 - **Configuration Inspector** -- View agent instructions, data source descriptions, instructions, few-shot examples, and connection details per source.
 - **Schema Explorer** -- Sidebar tree view of all data source elements (tables, columns, measures, entities) with selection status.
 - **Schema Inventory** -- Shows every exported table, column, and measure, including objects with missing descriptions and exports that omit child metadata.
 - **Analysis Dashboard** -- Configuration metrics, schema quality summary, response time chart, step breakdown table, and automated issue detection with severity levels.
 - **ERD View** -- Shows semantic model relationships.
 - **Multi-Source Support** -- Semantic Models, Lakehouse Tables, KQL Databases, Ontology (Graph), SQL Databases, and more.
+- **Azure AI Search Setup** -- Surfaces experimental Azure AI Search index, endpoint, search mode, top-k, and description configuration.
 - **Latency Analysis** -- Identify slow responses with detailed time breakdowns per step.
 - **Issue Detection** -- Automated checks for missing descriptions, failed runs, slow queries, unselected sources, and other common configuration problems.
+- **Analyze with AI (Experimental)** -- Use your own OpenRouter key for grounded diagnostic Q&A, full reviews, and semantic-model AI-readiness assessments. Context is minimized and redacted by default, previewed before submission, and grounded in Microsoft Fabric guidance.
 
 ## Supported Data Source Types
 
@@ -45,6 +51,9 @@ https://data-agent-inspector.streamlit.app/
 
 4. Upload a diagnostics JSON file using the sidebar.
 
+5. Optional: open **Analyze with AI (Experimental)**, enter an OpenRouter API
+   key and model, review the exact context, and confirm consent before sending.
+
 ### Deploy to Streamlit Cloud
 
 1. Push this repository to GitHub.
@@ -70,6 +79,7 @@ Sample files are included in the `sample_diagnostics/` folder for testing.
 - streamlit >= 1.30
 - pandas >= 2.0
 - plotly >= 5.18
+- requests >= 2.31
 
 ## License
 
