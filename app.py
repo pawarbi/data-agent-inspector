@@ -24,9 +24,8 @@ from query_analyzers import analyze_query
 # ──────────────────────────────────────────────────────────
 
 THRESHOLDS = {
-    "slow_turn_s": 20,         # Flag responses slower than this
+    "slow_turn_s": 45,         # Flag responses slower than this
     "slow_step_s": 10,         # Flag individual steps slower than this
-    "very_slow_turn_s": 30,    # Issue detection threshold
     "desc_char_limit": 200,    # DA truncates descriptions beyond this
     "instr_warn_chars": 8000,  # Warn if agent instructions exceed this
     "max_file_mb": 50,         # Warn before parsing files larger than this
@@ -2482,10 +2481,10 @@ def _render_latency_analysis(conversations):
             st.dataframe(df, use_container_width=True, hide_index=True)
 
     # Flag slow turns
-    slow = [r for r in rows if r["Response Time (s)"] > THRESHOLDS["very_slow_turn_s"]]
+    slow = [r for r in rows if r["Response Time (s)"] > THRESHOLDS["slow_turn_s"]]
     if slow:
         st.warning(
-            f"{len(slow)} turn(s) took >{THRESHOLDS['very_slow_turn_s']}s: "
+            f"{len(slow)} turn(s) took >{THRESHOLDS['slow_turn_s']}s: "
             + ", ".join(f"{r['Turn']} ({r['Response Time (s)']:.0f}s)" for r in slow)
         )
 
@@ -2884,11 +2883,11 @@ def _detect_issues(parsed):
             })
 
         # Slow response
-        if conv["response_time_s"] > THRESHOLDS["very_slow_turn_s"]:
+        if conv["response_time_s"] > THRESHOLDS["slow_turn_s"]:
             issues.append({
                 "Severity": "Warning",
                 "Category": "Latency",
-                "Issue": f"Turn {conv['turn']}: Response took {conv['response_time_s']:.0f}s (>{THRESHOLDS['very_slow_turn_s']}s threshold)",
+                "Issue": f"Turn {conv['turn']}: Response took {conv['response_time_s']:.0f}s (>{THRESHOLDS['slow_turn_s']}s threshold)",
                 "Recommendation": "Check DAX/SQL complexity, schema size, or model performance",
             })
 

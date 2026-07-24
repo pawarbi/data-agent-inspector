@@ -8,6 +8,10 @@ import app
 
 
 class DiagnosticsCompatibilityTests(unittest.TestCase):
+    def test_slow_turn_threshold_is_consistently_45_seconds(self):
+        self.assertEqual(app.THRESHOLDS["slow_turn_s"], 45)
+        self.assertNotIn("very_slow_turn_s", app.THRESHOLDS)
+
     def test_execution_header_has_explicit_dark_text_for_dark_mode(self):
         source = Path(app.__file__).read_text(encoding="utf-8")
         execution_header_css = re.search(
