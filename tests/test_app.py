@@ -1,4 +1,6 @@
 import json
+from pathlib import Path
+import re
 import unittest
 from unittest.mock import patch
 
@@ -6,6 +8,42 @@ import app
 
 
 class DiagnosticsCompatibilityTests(unittest.TestCase):
+    def test_execution_header_has_explicit_dark_text_for_dark_mode(self):
+        source = Path(app.__file__).read_text(encoding="utf-8")
+        execution_header_css = re.search(
+            r"\.execution-header\s*\{(?P<rules>.*?)\}",
+            source,
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(execution_header_css)
+        self.assertIn("color: #1a1a1a;", execution_header_css.group("rules"))
+
+    def test_turn_summary_inherits_active_theme_text_color(self):
+        source = Path(app.__file__).read_text(encoding="utf-8")
+        turn_summary_css = re.search(
+            r"\.turn-summary\s*\{(?P<rules>.*?)\}",
+            source,
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(turn_summary_css)
+        self.assertIn("color: inherit;", turn_summary_css.group("rules"))
+
+    def test_rephrased_question_is_rendered_as_highlighted_panel(self):
+        header_html, query_html = app._execution_header_html({
+            "status": "completed",
+            "source_name": "Sales model",
+            "source_type": "SemanticModel",
+            "nl_query": "Sales < 100 & active",
+            "duration_s": 4,
+        })
+
+        self.assertNotIn("Sales &lt; 100", header_html)
+        self.assertIn("Rephrased question", query_html)
+        self.assertIn("execution-query", query_html)
+        self.assertIn("Sales &lt; 100 &amp; active", query_html)
+
     def test_current_schema_is_valid_and_parsed(self):
         raw = {
             "diagnosticsSchemaVersion": 3,

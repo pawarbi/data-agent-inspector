@@ -85,7 +85,7 @@ st.markdown("""
     align-items: center;
     justify-content: space-between;
     margin: 10px 0 8px 0;
-    color: #555;
+    color: inherit;
     font-size: 13px;
 }
 .turn-summary-left {
@@ -123,6 +123,7 @@ st.markdown("""
     gap: 12px;
     padding: 10px 14px;
     background: #f8f9fa;
+    color: #1a1a1a;
     border-radius: 6px;
     border-left: 3px solid #2ecc71;
     font-size: 14px;
@@ -136,6 +137,29 @@ st.markdown("""
     color: #666;
     white-space: nowrap;
     font-size: 12px;
+}
+.execution-query {
+    margin: 0 0 12px 0;
+    padding: 10px 14px;
+    background: #eef4ff;
+    color: #1a2744;
+    border: 1px solid #cdd9f1;
+    border-left: 3px solid #4767b2;
+    border-radius: 6px;
+}
+.execution-query-label {
+    margin-bottom: 3px;
+    color: #4767b2;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+.execution-query-text {
+    font-size: 14px;
+    font-weight: 600;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
 }
 .review-grid {
     display: grid;
@@ -1997,24 +2021,40 @@ def _render_turn_latency(conv):
     )
 
 
-def _render_step(step):
-    """Render a Fabric-style execution card with code, result, and review tabs."""
+def _execution_header_html(step):
+    """Build the execution metadata and highlighted rephrased question."""
     status_class = "" if step["status"] == "completed" else " failed"
     source_name = step.get("source_name") or step.get("source_type") or "data source"
     header_parts = [f'Analyzed <strong>{html_lib.escape(source_name)}</strong>']
     if step.get("source_type"):
         header_parts.append(html_lib.escape(step["source_type"]))
-    if step["nl_query"]:
-        header_parts.append(f'for: &ldquo;<em>{html_lib.escape(step["nl_query"][:300])}</em>&rdquo;')
 
     duration_html = ""
     if step.get("duration_s", 0) > 0:
         duration_html = (
             f'<span class="execution-duration">{step["duration_s"]:.1f}s</span>'
         )
-    st.markdown(
+    query_html = ""
+    if step.get("nl_query"):
+        query_html = (
+            '<div class="execution-query">'
+            '<div class="execution-query-label">Rephrased question</div>'
+            f'<div class="execution-query-text">{html_lib.escape(step["nl_query"])}</div>'
+            '</div>'
+        )
+
+    return (
         f'<div class="execution-header{status_class}">'
         f'<div>{" ".join(header_parts)}</div>{duration_html}</div>',
+        query_html,
+    )
+
+
+def _render_step(step):
+    """Render a Fabric-style execution card with code, result, and review tabs."""
+    header_html, query_html = _execution_header_html(step)
+    st.markdown(
+        f"{header_html}{query_html}",
         unsafe_allow_html=True,
     )
 
